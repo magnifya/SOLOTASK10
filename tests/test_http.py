@@ -99,10 +99,43 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertIn("secret", payload)
         self.assertEqual(payload["secret_sha256"], sha(payload["secret"]))
+        self.assertTrue(payload["enabled"])
+        self.assertIsNone(payload["expires_at_ms"])
         status, _, reply = self.json_request("GET", "/api/items",
                                              headers={"authorization": "Bearer " + payload["secret"]})
         self.assertEqual(status, 200)
         self.assertEqual(reply["path"], "/api/items")
+
+    def test_key_creation_with_validity_fields_and_validation(self):
+        status, _, payload = self.json_request(
+            "POST", "/v1/keys",
+            {"tenant": "acme", "scopes": ["read"], "enabled": False, "expires_at_ms": 1000})
+        self.assertEqual(status, 201)
+        self.assertFalse(payload["enabled"])
+        self.assertEqual(payload["expires_at_ms"], 1000)
+        status, _, config = self.json_request("GET", "/v1/config")
+        created = {k["key_id"]: k for k in config["keys"]}[payload["key_id"]]
+        self.assertFalse(created["enabled"])
+        self.assertEqual(created["expires_at_ms"], 1000)
+        self.assertNotIn("secret_sha256", json.dumps(created))
+        # the disabled key is rejected by the proxy surface
+        status, _, reply = self.json_request(
+            "GET", "/api/items", headers={"authorization": "Bearer " + payload["secret"]})
+        self.assertEqual(status, 401)
+        self.assertEqual(reply["error"], "api key disabled")
+        self.assertIn("request_id", reply)
+        # invalid field values are 400 and change nothing
+        revision = self.gateway.store.revision
+        for bad in ({"enabled": "yes"}, {"enabled": None}, {"expires_at_ms": True},
+                    {"expires_at_ms": 0}, {"expires_at_ms": -1}, {"expires_at_ms": "1000"}):
+            body = {"tenant": "acme"}
+            body.update(bad)
+            status, _, reply = self.json_request("POST", "/v1/keys", body)
+            self.assertEqual(status, 400, bad)
+            self.assertIn("request_id", reply)
+        self.assertEqual(self.gateway.store.revision, revision)
+        status, _, config = self.json_request("GET", "/v1/config")
+        self.assertEqual(len(config["keys"]), 2)  # k-http plus the disabled one
 
     def test_quota_policy_creation_through_http(self):
         policy = {"id": "p-new", "tenant": "acme", "algorithm": "leaky-bucket",

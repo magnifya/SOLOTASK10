@@ -19,6 +19,7 @@ from .upstream import UpstreamError, default_registry
 REPLAY_HEADER = "X-Idempotent-Replay"
 CREDENTIAL_HEADERS = ("authorization", "x-api-key", "x-api-key-secret")
 HOP_HEADERS = ("host", "content-length", "connection", "transfer-encoding")
+_UNSET = object()
 
 
 class Gateway:
@@ -99,12 +100,19 @@ class Gateway:
         return routes[0].to_dict() if len(routes) == 1 else {"routes": [r.to_dict() for r in routes]}
 
     def add_key(self, tenant: str, scopes: Optional[List[str]] = None,
-                key_id: Optional[str] = None) -> Dict[str, Any]:
+                key_id: Optional[str] = None, enabled: Any = _UNSET,
+                expires_at_ms: Any = _UNSET) -> Dict[str, Any]:
         if not tenant:
             raise GatewayError("tenant is required")
         secret = secrets.token_urlsafe(24)
-        key = ApiKey(key_id=key_id or ("key-" + secrets.token_hex(6)), tenant=tenant,
-                     secret_sha256=sha256_hex(secret), scopes=list(scopes or []))
+        raw: Dict[str, Any] = {"key_id": key_id or ("key-" + secrets.token_hex(6)),
+                               "tenant": tenant, "secret_sha256": sha256_hex(secret),
+                               "scopes": list(scopes or [])}
+        if enabled is not _UNSET:
+            raw["enabled"] = enabled
+        if expires_at_ms is not _UNSET:
+            raw["expires_at_ms"] = expires_at_ms
+        key = ApiKey.from_dict(raw, "key")
         def mutate(document: Dict[str, Any]) -> None:
             if any(k.get("key_id") == key.key_id for k in document["keys"]):
                 raise GatewayError("api key already exists: %s" % key.key_id)
@@ -162,7 +170,7 @@ class Gateway:
             return {"status": int(status), "headers": out_headers, "body": text,
                     "request_id": request_id, "route_id": route.id if route else None}
 
-        key, auth_error = self._resolve_key(hdrs)
+        key, auth_error = self._resolve_key(hdrs, now)
         explicit_tenant = tenant or ""
         tenant = tenant or (key.tenant if key else "")
         candidates = self.config.matching_routes(method, path, tenant)
@@ -309,8 +317,15 @@ class Gateway:
             "body_sha256": body_hash, "expires_ms": now + self.idempotency_window_ms,
             "response": {"status": int(status), "body": text, "headers": {}}}
 
-    def _resolve_key(self, hdrs: Dict[str, str]) -> Tuple[Optional[ApiKey], Optional[str]]:
-        """Resolve the API key from the presented secret; the sha256 is compared."""
+    def _resolve_key(self, hdrs: Dict[str, str],
+                     now_ms: int) -> Tuple[Optional[ApiKey], Optional[str]]:
+        """Resolve the API key from the presented secret; the sha256 is compared.
+
+        A disabled or expired secret resolves like an invalid one: no key is
+        returned and the caller sees ``api key disabled`` / ``api key expired``
+        as the auth error, so anonymous routes treat it as no key at all while
+        authenticated routes and key partitions reject it with 401.
+        """
         secret = hdrs.get("x-api-key-secret") or ""
         authorization = hdrs.get("authorization") or ""
         if authorization.lower().startswith("bearer "):
@@ -328,6 +343,9 @@ class Gateway:
         stated = hdrs.get("x-api-key")
         if stated and stated != match.key_id:
             return None, "api key id does not match the presented secret"
+        invalid = match.invalid_reason(now_ms)
+        if invalid is not None:
+            return None, invalid
         return match, None
 
     @staticmethod

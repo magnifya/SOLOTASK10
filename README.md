@@ -13,7 +13,7 @@ configure.
 ## Running it
 
 ```bash
-# 1. run the test suite (103 tests, no network, no sleeping)
+# 1. run the test suite (117 tests, no network, no sleeping)
 python3 -m unittest discover -s tests -v
 
 # 2. start the gateway
@@ -58,10 +58,12 @@ tests; only the HTTP front end reads the wall clock.
 2. **Weighted pick.** Among candidates the longest `path_prefix` wins. Ties are
    resolved by weighted stable hashing (see below).
 3. **Auth.** Missing or unknown secret -> `401`; a stated `X-Api-Key` that does not
-   match the presented secret -> `401`; key tenant different from the route tenant,
-   or a missing route scope -> `403`. Routes with `"auth_required": false` skip
-   this step. Only `sha256(secret)` is ever stored, and it is compared in constant
-   time.
+   match the presented secret -> `401`; a disabled or expired key -> `401`
+   (`api key disabled` / `api key expired`, see
+   [Key disabling and expiry](#key-disabling-and-expiry)); key tenant different
+   from the route tenant, or a missing route scope -> `403`. Routes with
+   `"auth_required": false` skip this step. Only `sha256(secret)` is ever stored,
+   and it is compared in constant time.
 4. **Quota.** If the route names a `quota_policy`, one unit is charged against
    the partition resolved for that policy (see below). A rejected request gets
    `429` with `policy_id` and `reset_at_ms` plus a `Retry-After` header, and the
@@ -163,6 +165,48 @@ in-flight requests keep the order they started with — and editing
 invalid reload keeps the last valid configuration, the quota buckets, the
 breaker states and the existing health feedback.
 
+## Key disabling and expiry
+
+Every key carries two optional validity fields:
+
+* `enabled` — defaults to `true` and accepts only a JSON boolean (`null`
+  included is rejected);
+* `expires_at_ms` — omitted or `null` means the key never expires; anything
+  else must be a positive integer millisecond timestamp (booleans are not
+  integers here).
+
+Both fields are validated like every other config field: a bad value fails
+`load()` and `POST /v1/keys` with a `GatewayError` (`400`), changing neither
+the configuration, the revision nor any runtime state. `GET /v1/config` echoes
+both fields for every key (still never the secret or its hash), and
+`POST /v1/keys` echoes them on success; `Gateway.add_key` accepts them as
+optional keyword arguments, so existing callers create enabled, non-expiring
+keys — as does the `key-add` CLI.
+
+Credential resolution is unchanged — the secret's sha256 is matched and a
+stated `X-Api-Key` is checked against it — and only then is validity checked
+against the request's `now_ms` (the request start time on the HTTP proxy; a
+key whose `expires_at_ms` equals `now_ms` is already expired). A key that is
+both disabled and expired reports disabled. An invalid key resolves exactly
+like an invalid secret: authenticated routes and key-partition quota checks
+reject it with `401` (`api key disabled` / `api key expired`, keeping
+`request_id`), while other anonymous routes treat it as no key at all — its
+tenant and `key_id` are never derived from it, so the usual anonymous access
+and tenant-partition rules apply (an empty tenant on a tenant partition is
+still `400`). The rejection calls no upstream, consumes no quota and writes no
+usage; it appends one audit entry with `attempts: 0` and
+`idempotent_replay: false`. A stored idempotent response never lets an invalid
+key bypass authentication, and once the key is valid again quota is still
+checked before the replay.
+
+Toggling `enabled` or moving `expires_at_ms` through the usual hot reload
+applies to later requests only — in-flight requests keep their retry and
+failover behaviour — and resets neither quota buckets, breaker state nor the
+idempotency cache: a re-enabled key finds its quota bucket exactly as it was.
+An invalid reload keeps the last valid configuration with the usual `ready` /
+`last_error` feedback. Documents written before these fields existed load as
+enabled and non-expiring.
+
 ## Rate limit algorithms
 
 All three are driven purely by the injected `now_ms` and return
@@ -248,7 +292,8 @@ health state, error feedback and every bucket.
     "fallback_upstreams": ["echo-dr"]
   }],
   "keys": [{"key_id": "k-1", "tenant": "acme",
-            "secret_sha256": "<64 lowercase hex>", "scopes": ["read"]}],
+            "secret_sha256": "<64 lowercase hex>", "scopes": ["read"],
+            "enabled": true, "expires_at_ms": null}],
   "quota_policies": [{"id": "p-api", "tenant": "acme", "algorithm": "token-bucket",
                       "limit": 10, "window_ms": 1000, "burst": 20,
                       "partition_by": "tenant"}]
@@ -257,12 +302,15 @@ health state, error feedback and every bucket.
 
 `scopes` defaults to `[]` (no scope required); a key holding the `*` scope
 satisfies any requirement. `tenant: "*"` marks a route shared by every tenant.
+`enabled` defaults to `true` and `expires_at_ms` to `null` (see
+[Key disabling and expiry](#key-disabling-and-expiry)).
 `partition_by` defaults to `"policy"` and accepts only `"policy"`, `"tenant"`
 and `"key"` (see [Quota partitions](#quota-partitions)). `fallback_upstreams`
 defaults to `[]` and lists the ordered failover upstreams (see
 [Fallback upstreams](#fallback-upstreams)). `load()` rejects
 malformed documents with `GatewayError` (unknown algorithm, an invalid
-`partition_by`, an invalid `fallback_upstreams`, non-positive
+`partition_by`, an invalid `fallback_upstreams`, a non-boolean `enabled`, an
+invalid `expires_at_ms`, non-positive
 `limit`/`window_ms`/`burst`/`weight`,
 `path_prefix` without a leading `/`, malformed `secret_sha256`, duplicate ids, a
 route naming an unknown quota policy). `reload_if_changed()` re-reads the file
@@ -280,12 +328,12 @@ are unauthenticated in this skeleton - front them with your own auth in producti
 | GET | `/healthz` | `200 {"ok","ready","revision","routes","upstreams","config_error"}` | - |
 | GET | `/v1/config` | `200` sanitized config (never any secret or hash) | - |
 | POST | `/v1/config/reload` | `200 {"reloaded","revision","ready","error"}` | - |
-| POST | `/v1/keys` | `201 {"key_id","tenant","scopes","secret_sha256","secret"}` (secret returned once) | `400` bad JSON / missing tenant, `409` duplicate key id |
+| POST | `/v1/keys` | `201 {"key_id","tenant","scopes","secret_sha256","enabled","expires_at_ms","secret"}` (secret returned once) | `400` bad JSON / missing tenant / invalid `enabled` or `expires_at_ms`, `409` duplicate key id |
 | POST | `/v1/quota/policies` | `201` policy object (echoes `partition_by`) | `400` invalid policy / `partition_by`, `409` duplicate id |
 | GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | `400` non-integer `since` |
 | GET | `/v1/audit?tenant=&limit=` | `200 {"tenant","count","entries"}` | `400` non-integer `limit` |
 | POST | `/v1/breaker/reset` | `200 {"reset":["upstream",...]}` | `400` bad JSON |
-| * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition), `401` missing/unknown key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict, `429` quota exceeded, `502` upstream error, `503` breaker open |
+| * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition), `401` missing/unknown/disabled/expired key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict, `429` quota exceeded, `502` upstream error, `503` breaker open |
 
 A `/gw/{path}` prefix on the proxy surface is stripped before matching upstreams,
 so `/gw/api/items` is matched as `/api/items`.

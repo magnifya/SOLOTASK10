@@ -156,6 +156,157 @@ class QuotaTest(GatewayTestCase):
 
 
 SECRET_OTHER = "other-secret"
+SECRET_OFF = "off-secret"
+SECRET_EXP = "exp-secret"
+SECRET_BOTH = "both-secret"
+
+
+def validity_document():
+    return {
+        "quota_policies": [
+            {"id": "p-key", "tenant": "*", "algorithm": "token-bucket",
+             "limit": 2, "window_ms": 60000, "burst": 2, "partition_by": "key"},
+            {"id": "p-tenant", "tenant": "*", "algorithm": "token-bucket",
+             "limit": 2, "window_ms": 60000, "burst": 2, "partition_by": "tenant"}],
+        "keys": [
+            {"key_id": "k-on", "tenant": "acme", "secret_sha256": sha(SECRET_READ),
+             "scopes": ["read"]},
+            {"key_id": "k-off", "tenant": "acme", "secret_sha256": sha(SECRET_OFF),
+             "scopes": ["read"], "enabled": False},
+            {"key_id": "k-exp", "tenant": "acme", "secret_sha256": sha(SECRET_EXP),
+             "scopes": ["read"], "expires_at_ms": 1000},
+            {"key_id": "k-both", "tenant": "acme", "secret_sha256": sha(SECRET_BOTH),
+             "scopes": ["read"], "enabled": False, "expires_at_ms": 1000}],
+        "routes": [
+            {"id": "r-auth", "tenant": "acme", "match": {"method": "GET", "path_prefix": "/a"},
+             "upstream": "echo", "scopes": ["read"], "quota_policy": "p-key"},
+            {"id": "r-open", "tenant": "acme", "match": {"method": "GET", "path_prefix": "/o"},
+             "upstream": "echo", "auth_required": False},
+            {"id": "r-k", "tenant": "*", "match": {"method": "GET", "path_prefix": "/k"},
+             "upstream": "echo", "auth_required": False, "quota_policy": "p-key"},
+            {"id": "r-t", "tenant": "*", "match": {"method": "GET", "path_prefix": "/t"},
+             "upstream": "echo", "auth_required": False, "quota_policy": "p-tenant"}],
+    }
+
+
+class KeyValidityTest(unittest.TestCase):
+    def setUp(self):
+        self.gateway, self.root, self.path = make_gateway(validity_document())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.calls = []
+
+        def counting(request):
+            self.calls.append(request)
+            return {"status": 200, "body": {"n": len(self.calls)}}
+
+        self.gateway.upstreams.register("echo", counting)
+
+    def auth(self, secret):
+        return {"authorization": "Bearer " + secret}
+
+    def body_of(self, response):
+        return json.loads(response["body"])
+
+    def reload(self, mutate):
+        doc = validity_document()
+        mutate(doc)
+        write_config(self.path, doc)
+        self.assertTrue(self.gateway.reload_config())
+
+    def test_disabled_key_is_401_without_quota_usage_or_upstream(self):
+        response = self.gateway.handle("acme", "GET", "/a/x", self.auth(SECRET_OFF), "", now_ms=0)
+        self.assertEqual(response["status"], 401)
+        payload = self.body_of(response)
+        self.assertEqual(payload["error"], "api key disabled")
+        self.assertIn("request_id", payload)
+        self.assertEqual(len(self.calls), 0)
+        self.assertEqual(self.gateway.usage("acme")["requests"], 0)
+        entry = self.gateway.audit("acme", 1)[0]
+        self.assertEqual((entry["status"], entry["attempts"], entry["idempotent_replay"]),
+                         (401, 0, False))
+        self.assertIsNone(entry["key_id"])
+
+    def test_expiry_boundary_and_error_precedence(self):
+        ok = self.gateway.handle("acme", "GET", "/a/x", self.auth(SECRET_EXP), "", now_ms=999)
+        self.assertEqual(ok["status"], 200)
+        expired = self.gateway.handle("acme", "GET", "/a/x", self.auth(SECRET_EXP), "", now_ms=1000)
+        self.assertEqual(expired["status"], 401)
+        self.assertEqual(self.body_of(expired)["error"], "api key expired")
+        both = self.gateway.handle("acme", "GET", "/a/x", self.auth(SECRET_BOTH), "", now_ms=2000)
+        self.assertEqual(self.body_of(both)["error"], "api key disabled")
+
+    def test_invalid_key_on_plain_anonymous_route_is_treated_as_anonymous(self):
+        response = self.gateway.handle("", "GET", "/o/x", self.auth(SECRET_OFF), "", now_ms=0)
+        self.assertEqual(response["status"], 200)
+        entry = self.gateway.audit("", 1)[0]
+        self.assertIsNone(entry["key_id"])
+        self.assertEqual(entry["tenant"], "")
+
+    def test_invalid_key_on_key_partition_route_is_401(self):
+        off = self.gateway.handle("", "GET", "/k/x", self.auth(SECRET_OFF), "", now_ms=0)
+        exp = self.gateway.handle("", "GET", "/k/x", self.auth(SECRET_EXP), "", now_ms=1000)
+        self.assertEqual([off["status"], exp["status"]], [401, 401])
+        self.assertEqual(self.body_of(off)["error"], "api key disabled")
+        self.assertEqual(self.body_of(exp)["error"], "api key expired")
+        self.assertEqual(len(self.calls), 0)
+        self.assertEqual(self.gateway.usage("")["requests"], 0)
+
+    def test_invalid_key_does_not_supply_the_tenant_partition_identity(self):
+        no_tenant = self.gateway.handle("", "GET", "/t/x", self.auth(SECRET_OFF), "", now_ms=0)
+        self.assertEqual(no_tenant["status"], 400)
+        self.assertIn("tenant", self.body_of(no_tenant)["error"])
+        with_tenant = self.gateway.handle("acme", "GET", "/t/x", self.auth(SECRET_OFF), "", now_ms=0)
+        self.assertEqual(with_tenant["status"], 200)  # anonymous under the request tenant
+
+    def test_no_route_still_404_with_an_invalid_key(self):
+        response = self.gateway.handle("acme", "GET", "/nope", self.auth(SECRET_OFF), "", now_ms=0)
+        self.assertEqual(response["status"], 404)
+
+    def test_hot_reload_disable_and_enable_keeps_the_quota_bucket(self):
+        for _ in range(2):
+            self.assertEqual(
+                self.gateway.handle("acme", "GET", "/a/x", self.auth(SECRET_READ), "",
+                                    now_ms=0)["status"], 200)
+        self.assertEqual(
+            self.gateway.handle("acme", "GET", "/a/x", self.auth(SECRET_READ), "",
+                                now_ms=0)["status"], 429)
+        self.reload(lambda doc: doc["keys"][0].update(enabled=False))
+        disabled = self.gateway.handle("acme", "GET", "/a/x", self.auth(SECRET_READ), "", now_ms=0)
+        self.assertEqual((disabled["status"], self.body_of(disabled)["error"]),
+                         (401, "api key disabled"))
+        self.reload(lambda doc: None)  # back to the enabled document
+        # the bucket was not reset while the key was disabled
+        self.assertEqual(
+            self.gateway.handle("acme", "GET", "/a/x", self.auth(SECRET_READ), "",
+                                now_ms=0)["status"], 429)
+
+    def test_hot_reload_adjusts_the_expiry_for_later_requests(self):
+        self.assertEqual(
+            self.gateway.handle("acme", "GET", "/a/x", self.auth(SECRET_EXP), "",
+                                now_ms=500)["status"], 200)
+        self.reload(lambda doc: doc["keys"][2].update(expires_at_ms=400))
+        response = self.gateway.handle("acme", "GET", "/a/x", self.auth(SECRET_EXP), "", now_ms=500)
+        self.assertEqual((response["status"], self.body_of(response)["error"]),
+                         (401, "api key expired"))
+
+    def test_idempotent_replay_never_bypasses_key_validity(self):
+        headers = dict(self.auth(SECRET_READ), **{"x-idempotency-key": "idem-off"})
+        first = self.gateway.handle("acme", "GET", "/a/x", headers, "", now_ms=0)
+        self.assertEqual(first["status"], 200)
+        self.reload(lambda doc: doc["keys"][0].update(enabled=False))
+        blocked = self.gateway.handle("acme", "GET", "/a/x", headers, "", now_ms=1)
+        self.assertEqual(blocked["status"], 401)
+        self.assertNotIn("X-Idempotent-Replay", blocked["headers"])
+        self.assertEqual(len(self.calls), 1)
+        self.reload(lambda doc: None)  # re-enable
+        replay = self.gateway.handle("acme", "GET", "/a/x", headers, "", now_ms=2)
+        self.assertEqual(replay["status"], 200)
+        self.assertEqual(replay["headers"]["X-Idempotent-Replay"], "true")
+        self.assertEqual(len(self.calls), 1)
+        # quota is still checked before the replay: the two allowed requests above
+        # exhausted the bucket, so the next replay attempt is a 429
+        throttled = self.gateway.handle("acme", "GET", "/a/x", headers, "", now_ms=3)
+        self.assertEqual(throttled["status"], 429)
 
 
 def partition_document():
@@ -554,6 +705,46 @@ class ConfigTest(unittest.TestCase):
         with self.assertRaises(GatewayError):
             load(os.path.join(self.root, "absent.json"))
 
+    def key_doc(self, **fields):
+        key = {"key_id": "k", "tenant": "t",
+               "secret_sha256": hashlib.sha256(b"s").hexdigest()}
+        key.update(fields)
+        return {"keys": [key]}
+
+    def test_malformed_key_validity_fields_are_rejected(self):
+        cases = {
+            "enabled string": {"enabled": "yes"},
+            "enabled number": {"enabled": 1},
+            "enabled null": {"enabled": None},
+            "enabled list": {"enabled": [True]},
+            "expires bool": {"expires_at_ms": True},
+            "expires zero": {"expires_at_ms": 0},
+            "expires negative": {"expires_at_ms": -5},
+            "expires float": {"expires_at_ms": 1.5},
+            "expires string": {"expires_at_ms": "1000"},
+        }
+        for label, fields in cases.items():
+            write_config(self.path, self.key_doc(**fields))
+            with self.assertRaises(GatewayError, msg=label) as caught:
+                load(self.path)
+            self.assertEqual(caught.exception.status, 400)
+
+    def test_key_validity_defaults_and_round_trip(self):
+        write_config(self.path, self.key_doc())
+        key = load(self.path).keys[0]
+        self.assertTrue(key.enabled)
+        self.assertIsNone(key.expires_at_ms)
+        self.assertEqual(key.to_dict()["enabled"], True)
+        self.assertIsNone(key.to_dict()["expires_at_ms"])
+        write_config(self.path, self.key_doc(enabled=False, expires_at_ms=None))
+        key = load(self.path).keys[0]
+        self.assertFalse(key.enabled)
+        self.assertIsNone(key.expires_at_ms)
+        write_config(self.path, self.key_doc(expires_at_ms=1000))
+        key = load(self.path).keys[0]
+        self.assertEqual(key.expires_at_ms, 1000)
+        self.assertEqual(key.to_dict()["expires_at_ms"], 1000)
+
     def test_reload_only_when_the_mtime_moved(self):
         gateway, root, path = make_gateway()
         self.addCleanup(shutil.rmtree, root, True)
@@ -903,6 +1094,33 @@ class MutationTest(unittest.TestCase):
             self.gateway.add_policy(policy)
         with self.assertRaises(GatewayError):
             self.gateway.add_route(document()["routes"][0])
+
+    def test_add_key_echoes_validity_fields_and_defaults(self):
+        created = self.gateway.add_key("acme", ["read"])
+        self.assertTrue(created["enabled"])
+        self.assertIsNone(created["expires_at_ms"])
+        created = self.gateway.add_key("acme", ["read"], key_id="k-temp",
+                                       enabled=False, expires_at_ms=1000)
+        self.assertFalse(created["enabled"])
+        self.assertEqual(created["expires_at_ms"], 1000)
+        keys = {k["key_id"]: k for k in self.gateway.sanitized_config()["keys"]}
+        self.assertFalse(keys["k-temp"]["enabled"])
+        self.assertEqual(keys["k-temp"]["expires_at_ms"], 1000)
+        self.assertNotIn("secret_sha256", keys["k-temp"])
+        self.assertTrue(keys["k-read"]["enabled"])
+        self.assertIsNone(keys["k-read"]["expires_at_ms"])
+
+    def test_add_key_rejects_invalid_validity_fields_without_changing_state(self):
+        before = json.dumps(self.gateway.sanitized_config(), sort_keys=True)
+        revision = self.gateway.store.revision
+        for kwargs in ({"enabled": "yes"}, {"enabled": 1}, {"enabled": None},
+                       {"expires_at_ms": True}, {"expires_at_ms": 0},
+                       {"expires_at_ms": -1}, {"expires_at_ms": "1000"}):
+            with self.assertRaises(GatewayError, msg=repr(kwargs)) as caught:
+                self.gateway.add_key("acme", ["read"], **kwargs)
+            self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(json.dumps(self.gateway.sanitized_config(), sort_keys=True), before)
+        self.assertEqual(self.gateway.store.revision, revision)
 
     def test_mutations_need_a_config_path(self):
         gateway = Gateway(config_path=None, data_dir=os.path.join(self.root, "empty"))
