@@ -13,7 +13,7 @@ configure.
 ## Running it
 
 ```bash
-# 1. run the test suite (117 tests, no network, no sleeping)
+# 1. run the test suite (136 tests, no network, no sleeping)
 python3 -m unittest discover -s tests -v
 
 # 2. start the gateway
@@ -64,12 +64,18 @@ tests; only the HTTP front end reads the wall clock.
    from the route tenant, or a missing route scope -> `403`. Routes with
    `"auth_required": false` skip this step. Only `sha256(secret)` is ever stored,
    and it is compared in constant time.
-4. **Quota.** If the route names a `quota_policy`, one unit is charged against
-   the partition resolved for that policy (see below). A rejected request gets
-   `429` with `policy_id` and `reset_at_ms` plus a `Retry-After` header, and the
-   *rejected attempt is still written to the ledger*. Identity rejections raised
-   while resolving a partition (`400`/`401`/`403`) consume no quota, write no
-   usage and never call the upstream, but are still audited.
+4. **Quota.** A route names one policy (`quota_policy`, the historical form) or
+   an ordered, non-empty list (`quota_policies`, joint admission). Each named
+   policy charges one unit against the partition resolved for that policy (see
+   below). For a joint check, partition identities are verified in declaration
+   order and the first failure decides the response; the buckets themselves are
+   admitted as a group — either every policy pays one unit or none does. A
+   rejected request gets `429` with `policy_id` (the first policy in declaration
+   order that was short), `reset_at_ms` (the latest recovery time among the
+   short policies) and a `Retry-After` header, and the *rejected attempt is
+   still written to the ledger* (one entry per named policy). Identity
+   rejections raised while resolving a partition (`400`/`401`/`403`) consume no
+   quota, write no usage and never call the upstream, but are still audited.
 5. **Idempotency.** See below; a replay short circuits the rest of the pipeline.
 6. **Circuit breaker + retries + failover.** One breaker per upstream name; an
    open breaker returns `503 {"error":"upstream unavailable","state":"open"}`
@@ -88,7 +94,10 @@ tests; only the HTTP front end reads the wall clock.
 8. **Audit.** One JSON line per request is appended to `<data-dir>/audit.jsonl`
    with `at`, `request_id`, `tenant`, `key_id`, `route_id`, `upstream`, `status`,
    `latency_ms`, `attempts`, `quota{policy_id,allowed,remaining}` and
-   `idempotent_replay`.
+   `idempotent_replay`. A `quota_policies` route additionally carries `quotas`,
+   an ordered list of `{policy_id, allowed, remaining}` in declaration order; the
+   legacy `quota` block equals its first entry. `quotas` is `[]` (and `quota`
+   keeps its unchecked value) when such a request never reached the joint check.
 
 ## Weighted routing (documented rule)
 
@@ -228,8 +237,12 @@ sliding window is the exact count of timestamps in the trailing window.
 `QuotaLedger` appends one JSON object per line to `<data-dir>/usage.jsonl`
 (`at`, `tenant`, `policy_id`, `key_id`, `cost`, `allowed`) with a single `write`
 call per entry, so a crash can only leave a torn trailing line, which readers
-skip. `usage(tenant, since_ms)` aggregates requests, allowed, rejected and cost,
-overall and per policy.
+skip. A joint admission writes one record per named policy for a single request:
+every record has `cost: 1` and carries the whole group's verdict in `allowed`
+(all `true` on admission, all `false` otherwise). `usage(tenant, since_ms)`
+aggregates requests, allowed, rejected and cost, overall and per policy, so
+`requests` counts records (one per policy per request) while `allowed_cost`
+counts only the records of admitted groups.
 
 ## Quota partitions
 
@@ -264,11 +277,11 @@ audit entry, but do not consume quota, do not write a usage record and do not
 call the upstream. `Gateway.handle` and the HTTP proxy run identical partition
 rules.
 
-Each quota check is still a one-unit allow-then-consume guarded by a single
-lock, so concurrent requests in the same partition can never exceed the limit.
-An idempotent replay checks quota before replaying, and upstream retries are not
-billed twice. `429` and `Retry-After` keep their meaning, and the usage and
-audit summaries keep their existing shape.
+Each single-policy quota check is a one-unit allow-then-consume guarded by a
+single lock, so concurrent requests in the same partition can never exceed the
+limit. An idempotent replay checks quota before replaying, and upstream retries
+are not billed twice. `429` and `Retry-After` keep their meaning, and the usage
+and audit summaries keep their existing shape.
 
 A valid hot reload preserves a policy's partition buckets while its `id`,
 `tenant`, `partition_by` and algorithm parameters (`algorithm`, `limit`,
@@ -276,6 +289,53 @@ A valid hot reload preserves a policy's partition buckets while its `id`,
 policy's partitions from their initial state; removing the policy and adding it
 back also starts fresh. An invalid reload keeps the previous configuration,
 health state, error feedback and every bucket.
+
+## Joint quota admission
+
+A route normally names one policy with `quota_policy`. It may instead name
+`quota_policies`: an **ordered, non-empty** array of policy ids, letting one
+request be jointly constrained by several budgets at once (for example the
+tenant total and the per-key budget). Omitting `quota_policies` leaves the
+historical `quota_policy` semantics untouched. The field is validated like
+every other config field — `null`, an empty array, a non-array, a non-string or
+empty-string entry, a duplicate id, an unknown policy, or setting it together
+with a non-empty `quota_policy` all fail with a `GatewayError`. Config loading,
+`route-add` and hot reload run the same validation; a rejected batch add writes
+none of its routes and leaves the revision unchanged. `GET /v1/config` echoes
+`quota_policies` only on routes that set it, so older route documents keep their
+exact output.
+
+`Gateway.handle` and the HTTP proxy run identical rules. After the existing
+authentication step, the partition identity of every named policy is checked in
+declaration order and the first failure decides the response: a tenant
+partition without a tenant is `400`, a key partition without a valid key is
+`401`, and a valid key presented alongside an explicit request tenant that does
+not match the key's tenant is `403`. These responses consume no quota, write no
+usage and call no upstream.
+
+Once identities are resolved, the named buckets are admitted as a group under
+one lock: every bucket is probed without mutating state, and the request
+proceeds only when **all** policies have room, in which case each pays one unit.
+If any policy is short, none pays — a concurrent group in the same partitions
+can neither partially charge nor exceed a limit, and all three algorithms and
+partition modes compose. On rejection the response is `429` with `policy_id`
+set to the first short policy in declaration order, `reset_at_ms` the latest
+recovery time across all short policies, and the usual `Retry-After`
+conversion.
+
+One joint check writes one usage record per named policy in the existing format,
+each with `cost: 1`; every record's `allowed` is the whole group's verdict, so
+`requests` counts records while `allowed_cost` counts only admitted groups.
+Audit stays one line per request: a joint route adds `quotas` (ordered
+`{policy_id, allowed, remaining}`, with `quota` equal to its first item); on
+rejection `remaining` is the un deducted available balance, and when the request
+never reached the joint check `quotas` is `[]` and `quota` keeps its unchecked
+value. Idempotent replays and conflicts still check quota first, and retries,
+failover and the breaker never charge extra. A valid hot reload that only
+changes a route's policy combination keeps quota buckets, breaker state and the
+idempotency cache; in-flight requests keep the combination they started with,
+and an invalid reload keeps the previous configuration, state and health
+feedback through the usual `ready` / `last_error` channel.
 
 ## Configuration
 
@@ -290,13 +350,22 @@ health state, error feedback and every bucket.
                   "response_headers": {"X-Served-By": "gwd"}},
     "quota_policy": "p-api", "timeout_ms": 5000,
     "fallback_upstreams": ["echo-dr"]
+  }, {
+    "id": "r-both", "tenant": "acme",
+    "match": {"method": "GET", "path_prefix": "/both"},
+    "upstream": "echo", "auth_required": true,
+    "quota_policies": ["p-tenant-total", "p-key-budget"]
   }],
   "keys": [{"key_id": "k-1", "tenant": "acme",
             "secret_sha256": "<64 lowercase hex>", "scopes": ["read"],
             "enabled": true, "expires_at_ms": null}],
   "quota_policies": [{"id": "p-api", "tenant": "acme", "algorithm": "token-bucket",
                       "limit": 10, "window_ms": 1000, "burst": 20,
-                      "partition_by": "tenant"}]
+                      "partition_by": "tenant"},
+                     {"id": "p-tenant-total", "tenant": "acme", "algorithm": "token-bucket",
+                      "limit": 100, "window_ms": 1000, "partition_by": "tenant"},
+                     {"id": "p-key-budget", "tenant": "acme", "algorithm": "sliding-window",
+                      "limit": 5, "window_ms": 1000, "partition_by": "key"}]
 }
 ```
 
@@ -313,7 +382,9 @@ malformed documents with `GatewayError` (unknown algorithm, an invalid
 invalid `expires_at_ms`, non-positive
 `limit`/`window_ms`/`burst`/`weight`,
 `path_prefix` without a leading `/`, malformed `secret_sha256`, duplicate ids, a
-route naming an unknown quota policy). `reload_if_changed()` re-reads the file
+route naming an unknown quota policy, or a malformed `quota_policies` — `null`,
+empty, non-array, non-string/empty entries, duplicates or both `quota_policy`
+and `quota_policies` set). `reload_if_changed()` re-reads the file
 only when its mtime moved and keeps `ready` true only when the new document is
 valid; an invalid reload keeps the last known good config, sets `ready = false`
 and records `last_error`.

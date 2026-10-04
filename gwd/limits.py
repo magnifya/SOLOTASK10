@@ -76,6 +76,18 @@ class TokenBucket:
                 "reset_at_ms": now_ms + _wait_ms(max(0.0, cost - self.tokens), self.rate),
                 "algorithm": self.algorithm, "limit": int(self.capacity)}
 
+    def peek(self, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
+        """Non mutating admission check: ``remaining`` is the available balance
+        *without* paying ``cost`` and no state is updated."""
+        now_ms = int(now_ms)
+        tokens = self.capacity if self.last_ms is None else min(
+            self.capacity, self.tokens + max(0, now_ms - self.last_ms) * self.rate)
+        allowed = tokens >= cost
+        projected = tokens - cost if allowed else tokens
+        return {"allowed": allowed, "remaining": max(0, int(tokens)),
+                "reset_at_ms": now_ms + _wait_ms(max(0.0, cost - projected), self.rate),
+                "algorithm": self.algorithm, "limit": int(self.capacity)}
+
 
 class LeakyBucket:
     """Queue free leaky bucket: the level rises by ``cost`` and leaks at ``rate``.
@@ -107,6 +119,19 @@ class LeakyBucket:
                 "reset_at_ms": now_ms + _wait_ms(need, self.rate),
                 "algorithm": self.algorithm, "limit": int(self.capacity)}
 
+    def peek(self, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
+        """Non mutating admission check; ``remaining`` is the free capacity
+        before ``cost`` would be queued and no state is updated."""
+        now_ms = int(now_ms)
+        level = 0.0 if self.last_ms is None else max(
+            0.0, self.level - max(0, now_ms - self.last_ms) * self.rate)
+        allowed = level + cost <= self.capacity
+        projected = level + cost if allowed else level
+        need = max(0.0, projected + cost - self.capacity)
+        return {"allowed": allowed, "remaining": max(0, int(self.capacity - level)),
+                "reset_at_ms": now_ms + _wait_ms(need, self.rate),
+                "algorithm": self.algorithm, "limit": int(self.capacity)}
+
 
 class SlidingWindow:
     """Exact count of admitted timestamps inside the trailing ``window_ms``."""
@@ -132,6 +157,24 @@ class SlidingWindow:
         else:  # the (cost - remaining)-th oldest stamp has to expire first
             index = max(0, min(len(self.stamps) - self.limit + cost - 1, len(self.stamps) - 1))
             reset_at_ms = self.stamps[index] + self.window_ms
+        return {"allowed": allowed, "remaining": remaining, "reset_at_ms": reset_at_ms,
+                "algorithm": self.algorithm, "limit": self.limit}
+
+    def peek(self, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
+        """Non mutating admission check; no timestamp is appended. ``remaining``
+        is the count still available before ``cost`` would be admitted, and on
+        rejection ``reset_at_ms`` mirrors what ``allow`` would have reported."""
+        now_ms = int(now_ms)
+        cutoff = now_ms - self.window_ms
+        live = [stamp for stamp in self.stamps if stamp > cutoff]
+        count = len(live)
+        allowed = count + cost <= self.limit
+        remaining = max(0, self.limit - count)
+        if allowed:
+            reset_at_ms = now_ms
+        else:  # same recovery stamp ``allow`` computes for a rejected request
+            index = max(0, min(count - self.limit + cost - 1, count - 1))
+            reset_at_ms = live[index] + self.window_ms
         return {"allowed": allowed, "remaining": remaining, "reset_at_ms": reset_at_ms,
                 "algorithm": self.algorithm, "limit": self.limit}
 
@@ -209,6 +252,35 @@ class Limiter:
             result = self.bucket(policy_id, part).allow(cost, now_ms)
         result["policy_id"] = policy_id
         return result
+
+    def allow_group(self, checks: List[tuple], cost: int, now_ms: int) -> List[Dict[str, Any]]:
+        """Joint admission for an ordered list of ``(policy_id, partition)``.
+
+        Every policy is probed non mutatingly first; the group is admitted only
+        when all probes pass, in which case every bucket pays ``cost`` exactly
+        once. When any probe fails no bucket state changes at all, so the group
+        can neither partially pay nor exceed a limit. All of this runs under one
+        lock, so concurrent groups in the same partitions cannot interleave a
+        partial charge. Each returned result carries the *group* verdict in
+        ``allowed`` and, on rejection, the un deducted available balance in
+        ``remaining``.
+        """
+        resolved = []
+        with self._lock:
+            for policy_id, partition in checks:
+                part = POLICY_PARTITION if partition is None else partition
+                resolved.append((policy_id, part, self.bucket(policy_id, part)))
+            verdicts = [bucket.peek(cost, now_ms) for _, _, bucket in resolved]
+            group_allowed = all(verdict["allowed"] for verdict in verdicts)
+            results: List[Dict[str, Any]] = []
+            for (policy_id, _, bucket), verdict in zip(resolved, verdicts):
+                if group_allowed:
+                    result = bucket.allow(cost, now_ms)
+                else:
+                    result = verdict
+                result["policy_id"] = policy_id
+                results.append(result)
+        return results
 
 
 class QuotaLedger:
