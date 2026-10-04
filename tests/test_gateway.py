@@ -587,6 +587,293 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("k-read", blob)
 
 
+class FallbackTest(unittest.TestCase):
+    """Ordered fallback upstreams: per-upstream retries and breakers, failover
+    only on transport errors and 5xx, and only for GET or idempotent requests."""
+
+    def setUp(self):
+        doc = document()
+        doc["routes"].append({
+            "id": "r-fb", "tenant": "acme", "match": {"method": "*", "path_prefix": "/fb"},
+            "upstream": "primary", "auth_required": False,
+            "fallback_upstreams": ["backup-a", "backup-b"]})
+        doc["routes"].append({
+            "id": "r-fbq", "tenant": "acme", "match": {"method": "GET", "path_prefix": "/fbq"},
+            "upstream": "primary", "auth_required": False, "quota_policy": "p-fast",
+            "fallback_upstreams": ["backup-a"]})
+        self.gateway, self.root, self.path = make_gateway(
+            doc, breaker_settings={"failure_threshold": 1, "open_ms": 1000,
+                                   "success_threshold": 1})
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.calls = {"primary": [], "backup-a": [], "backup-b": []}
+
+    def register(self, name, fn):
+        def counting(request, _fn=fn, _name=name):
+            self.calls[_name].append(request)
+            return _fn(request)
+        self.gateway.upstreams.register(name, counting)
+
+    def ok(self, request):
+        return {"status": 200, "body": {"ok": True}}
+
+    def boom(self, request):
+        raise UpstreamError("boom")
+
+    def down(self, request):
+        return {"status": 500, "body": {"error": "down"}}
+
+    def body_of(self, response):
+        return json.loads(response["body"])
+
+    def test_get_fails_over_on_transport_error(self):
+        self.register("primary", self.boom)
+        self.register("backup-a", self.ok)
+        response = self.gateway.handle("acme", "GET", "/fb/x", {}, "", now_ms=0)
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(len(self.calls["primary"]), 3)   # full retry budget first
+        self.assertEqual(len(self.calls["backup-a"]), 1)
+        self.assertEqual(len(self.calls["backup-b"]), 0)
+        entry = self.gateway.audit("acme", 1)[0]
+        self.assertEqual((entry["attempts"], entry["upstream"], entry["status"]),
+                         (4, "backup-a", 200))
+
+    def test_get_fails_over_on_5xx_after_exhausting_retries(self):
+        self.register("primary", self.down)
+        self.register("backup-a", self.ok)
+        response = self.gateway.handle("acme", "GET", "/fb/x", {}, "", now_ms=0)
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(len(self.calls["primary"]), 3)
+        self.assertEqual(self.gateway.audit("acme", 1)[0]["attempts"], 4)
+
+    def test_non_5xx_status_is_returned_without_failover(self):
+        self.register("primary", lambda request: {"status": 404, "body": {"error": "gone"}})
+        self.register("backup-a", self.ok)
+        response = self.gateway.handle("acme", "GET", "/fb/x", {}, "", now_ms=0)
+        self.assertEqual(response["status"], 404)
+        self.assertEqual(len(self.calls["backup-a"]), 0)
+
+    def test_408_is_retried_then_returned_without_failover(self):
+        self.register("primary", lambda request: {"status": 408, "body": {}})
+        self.register("backup-a", self.ok)
+        response = self.gateway.handle("acme", "GET", "/fb/x", {}, "", now_ms=0)
+        self.assertEqual(response["status"], 408)
+        self.assertEqual(len(self.calls["primary"]), 3)  # existing retry rule
+        self.assertEqual(len(self.calls["backup-a"]), 0)
+
+    def test_post_without_an_idempotency_key_never_fails_over(self):
+        self.register("primary", self.boom)
+        self.register("backup-a", self.ok)
+        response = self.gateway.handle("acme", "POST", "/fb/x", {}, "{}", now_ms=0)
+        self.assertEqual(response["status"], 502)
+        self.assertEqual(len(self.calls["primary"]), 3)
+        self.assertEqual(len(self.calls["backup-a"]), 0)
+        self.assertEqual(len(self.calls["backup-b"]), 0)
+
+    def test_post_with_an_idempotency_key_fails_over(self):
+        self.register("primary", self.boom)
+        self.register("backup-a", self.ok)
+        headers = {"x-idempotency-key": "fb-idem"}
+        response = self.gateway.handle("acme", "POST", "/fb/x", headers, "{}", now_ms=0)
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(len(self.calls["backup-a"]), 1)
+
+    def test_breaker_open_upstream_is_skipped_without_a_call(self):
+        self.register("primary", self.ok)
+        self.register("backup-a", self.ok)
+        self.gateway.breakers.get("primary").record(False, 0)  # threshold 1: trips open
+        response = self.gateway.handle("acme", "GET", "/fb/x", {}, "", now_ms=1)
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(len(self.calls["primary"]), 0)
+        self.assertEqual(len(self.calls["backup-a"]), 1)
+        entry = self.gateway.audit("acme", 1)[0]
+        self.assertEqual((entry["upstream"], entry["attempts"]), ("backup-a", 1))
+
+    def test_all_breakers_open_returns_503_with_the_primary_state(self):
+        for name in ("primary", "backup-a", "backup-b"):
+            self.gateway.breakers.get(name).record(False, 0)
+        response = self.gateway.handle("acme", "GET", "/fb/x", {}, "", now_ms=1)
+        self.assertEqual(response["status"], 503)
+        self.assertEqual(self.body_of(response)["state"], "open")
+        self.assertEqual(sum(len(v) for v in self.calls.values()), 0)
+        entry = self.gateway.audit("acme", 1)[0]
+        self.assertEqual((entry["attempts"], entry["upstream"]), (0, "primary"))
+
+    def test_fallback_chain_exhausted_returns_the_last_5xx_response(self):
+        self.register("primary", self.down)
+        self.register("backup-a", self.down)
+        self.register("backup-b", lambda request: {"status": 503, "body": {"last": True},
+                                                   "headers": {"X-Last": "b"}})
+        response = self.gateway.handle("acme", "GET", "/fb/x", {}, "", now_ms=0)
+        self.assertEqual(response["status"], 503)
+        self.assertTrue(self.body_of(response)["last"])
+        self.assertEqual(response["headers"]["X-Last"], "b")
+        entry = self.gateway.audit("acme", 1)[0]
+        self.assertEqual((entry["attempts"], entry["upstream"]), (9, "backup-b"))
+
+    def test_fallback_chain_exhausted_by_transport_errors_is_502(self):
+        for name in ("primary", "backup-a", "backup-b"):
+            self.register(name, self.boom)
+        response = self.gateway.handle("acme", "GET", "/fb/x", {}, "", now_ms=0)
+        self.assertEqual(response["status"], 502)
+        self.assertEqual(self.body_of(response)["upstream"], "backup-b")
+        self.assertEqual(self.gateway.audit("acme", 1)[0]["attempts"], 9)
+
+    def test_unregistered_fallback_is_treated_as_a_transport_error(self):
+        self.register("primary", self.boom)
+        # backup-a is never registered; backup-b answers
+        self.register("backup-b", self.ok)
+        response = self.gateway.handle("acme", "GET", "/fb/x", {}, "", now_ms=0)
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(len(self.calls["backup-b"]), 1)
+
+    def test_failover_charges_quota_and_writes_usage_exactly_once(self):
+        self.register("primary", self.boom)
+        self.register("backup-a", self.ok)
+        response = self.gateway.handle("acme", "GET", "/fbq/x", {}, "", now_ms=0)
+        self.assertEqual(response["status"], 200)
+        usage = self.gateway.usage("acme")
+        self.assertEqual((usage["requests"], usage["allowed"]), (1, 1))
+        self.assertEqual(len(self.calls["primary"]) + len(self.calls["backup-a"]), 4)
+
+    def test_idempotency_stores_only_the_final_non_5xx_response(self):
+        self.register("primary", self.down)
+        self.register("backup-a", self.ok)
+        headers = {"x-idempotency-key": "fb-cache"}
+        first = self.gateway.handle("acme", "POST", "/fb/x", headers, "{}", now_ms=0)
+        second = self.gateway.handle("acme", "POST", "/fb/x", headers, "{}", now_ms=1)
+        self.assertEqual((first["status"], second["status"]), (200, 200))
+        self.assertEqual(second["headers"]["X-Idempotent-Replay"], "true")
+        total = sum(len(v) for v in self.calls.values())
+        self.assertEqual(total, 4)  # the replay ran no upstream call at all
+
+    def test_final_5xx_is_not_cached_for_idempotent_replay(self):
+        for name in ("primary", "backup-a", "backup-b"):
+            self.register(name, self.down)
+        headers = {"x-idempotency-key": "fb-miss"}
+        first = self.gateway.handle("acme", "POST", "/fb/x", headers, "{}", now_ms=0)
+        self.gateway.breaker_reset()  # the 5xx calls tripped every breaker
+        second = self.gateway.handle("acme", "POST", "/fb/x", headers, "{}", now_ms=1)
+        self.assertEqual((first["status"], second["status"]), (500, 500))
+        self.assertNotIn("X-Idempotent-Replay", second["headers"])
+        self.assertEqual(sum(len(v) for v in self.calls.values()), 18)
+
+    def test_route_without_fallbacks_keeps_the_original_behaviour(self):
+        attempts = []
+
+        def flaky(request):
+            attempts.append(request)
+            raise UpstreamError("boom")
+
+        self.gateway.upstreams.register("flaky", flaky)
+        self.gateway.add_route({"id": "r-flaky", "tenant": "acme",
+                                "match": {"method": "GET", "path_prefix": "/flaky"},
+                                "upstream": "flaky", "auth_required": False})
+        first = self.gateway.handle("acme", "GET", "/flaky/x", {}, "", now_ms=0)
+        self.assertEqual((first["status"], len(attempts)), (502, 3))
+        second = self.gateway.handle("acme", "GET", "/flaky/x", {}, "", now_ms=10)
+        self.assertEqual(second["status"], 503)
+        self.assertEqual(self.body_of(second)["state"], "open")
+        self.assertEqual(len(attempts), 3)
+
+    def test_hot_reload_applies_the_new_order_and_keeps_breaker_state(self):
+        self.register("primary", self.ok)
+        self.register("backup-a", self.ok)
+        self.register("backup-b", self.ok)
+        self.gateway.breakers.get("primary").record(False, 0)  # open
+        doc = document()
+        doc["routes"].append({
+            "id": "r-fb", "tenant": "acme", "match": {"method": "*", "path_prefix": "/fb"},
+            "upstream": "primary", "auth_required": False,
+            "fallback_upstreams": ["backup-b", "backup-a"]})  # swapped order
+        doc["routes"].append({
+            "id": "r-fbq", "tenant": "acme", "match": {"method": "GET", "path_prefix": "/fbq"},
+            "upstream": "primary", "auth_required": False, "quota_policy": "p-fast",
+            "fallback_upstreams": ["backup-a"]})
+        write_config(self.path, doc)
+        self.assertTrue(self.gateway.reload_config())
+        response = self.gateway.handle("acme", "GET", "/fb/x", {}, "", now_ms=1)
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(len(self.calls["backup-b"]), 1)   # new order: backup-b first
+        self.assertEqual(len(self.calls["backup-a"]), 0)
+        self.assertEqual(self.gateway.breakers.get("primary").state, "open")
+
+    def test_invalid_reload_keeps_the_last_good_fallback_config(self):
+        self.register("primary", self.boom)
+        self.register("backup-a", self.ok)
+        doc = document()
+        doc["routes"].append({
+            "id": "r-fb", "tenant": "acme", "match": {"method": "*", "path_prefix": "/fb"},
+            "upstream": "primary", "auth_required": False,
+            "fallback_upstreams": ["primary"]})  # repeats the primary: invalid
+        write_config(self.path, doc)
+        self.assertFalse(self.gateway.reload_config())
+        self.assertFalse(self.gateway.store.ready)
+        response = self.gateway.handle("acme", "GET", "/fb/x", {}, "", now_ms=0)
+        self.assertEqual(response["status"], 200)  # old chain still in effect
+        self.assertEqual(len(self.calls["backup-a"]), 1)
+
+
+class FallbackConfigTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="gwd-fallback-config-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.path = os.path.join(self.root, "config.json")
+
+    def route(self, **extra):
+        base = {"id": "r", "match": {"method": "GET", "path_prefix": "/a"},
+                "upstream": "echo"}
+        base.update(extra)
+        return base
+
+    def test_malformed_fallback_lists_are_rejected(self):
+        cases = {
+            "null": None,
+            "not an array": "echo",
+            "non-string entry": ["a", 1],
+            "empty entry": [""],
+            "duplicate entry": ["a", "a"],
+            "repeats the primary": ["a", "echo"],
+        }
+        for label, value in cases.items():
+            doc = {"routes": [dict(self.route(), fallback_upstreams=value)]}
+            write_config(self.path, doc)
+            with self.assertRaises(GatewayError, msg=label):
+                load(self.path)
+
+    def test_omitted_fallbacks_default_to_empty_and_round_trip(self):
+        write_config(self.path, {"routes": [self.route()]})
+        route = load(self.path).routes[0]
+        self.assertEqual(route.fallback_upstreams, [])
+        self.assertEqual(route.to_dict()["fallback_upstreams"], [])
+        write_config(self.path, {"routes": [self.route(fallback_upstreams=["b", "c"])]})
+        route = load(self.path).routes[0]
+        self.assertEqual(route.fallback_upstreams, ["b", "c"])
+        self.assertEqual(route.to_dict()["fallback_upstreams"], ["b", "c"])
+
+    def test_sanitized_config_reports_fallback_upstreams(self):
+        gateway, root, _ = make_gateway()
+        self.addCleanup(shutil.rmtree, root, True)
+        gateway.add_route({"id": "r-fb", "tenant": "acme",
+                           "match": {"method": "GET", "path_prefix": "/fb"},
+                           "upstream": "echo", "fallback_upstreams": ["ghost"]})
+        routes = {r["id"]: r for r in gateway.sanitized_config()["routes"]}
+        self.assertEqual(routes["r-fb"]["fallback_upstreams"], ["ghost"])
+        self.assertEqual(routes["r-api"]["fallback_upstreams"], [])
+
+    def test_route_add_rejects_bad_fallbacks_without_changing_the_config(self):
+        gateway, root, path = make_gateway()
+        self.addCleanup(shutil.rmtree, root, True)
+        before = json.dumps(gateway.sanitized_config(), sort_keys=True)
+        for bad in (None, "echo", [""], ["a", "a"], ["echo"], [1]):
+            with self.assertRaises(GatewayError, msg=repr(bad)):
+                gateway.add_route({"id": "r-bad", "tenant": "acme",
+                                   "match": {"method": "GET", "path_prefix": "/bad"},
+                                   "upstream": "echo", "fallback_upstreams": bad})
+        self.assertEqual(json.dumps(gateway.sanitized_config(), sort_keys=True), before)
+        with open(path, "r", encoding="utf-8") as handle:
+            self.assertNotIn("r-bad", handle.read())
+
+
 class MutationTest(unittest.TestCase):
     def setUp(self):
         self.gateway, self.root, self.path = make_gateway()

@@ -245,30 +245,54 @@ class Gateway:
                     return finish(replay["status"], body_text=replay["body"],
                                   extra_headers=replay_headers, replay=True)
 
-        # 5. circuit breaker and upstream call with retries
+        # 5. circuit breaker and upstream call with retries, then failover.
+        # Fallback upstreams are considered only for GET requests or requests
+        # carrying a non-empty X-Idempotency-Key; anything else still calls the
+        # primary upstream alone. Each upstream keeps its own retry budget and
+        # breaker; a breaker rejection skips it without a call, and only a
+        # transport error or a 5xx left after the retries moves to the next one.
+        if method == "GET" or hdrs.get("x-idempotency-key"):
+            chain = [route.upstream] + list(route.fallback_upstreams)
+        else:
+            chain = [route.upstream]
         upstream_name = route.upstream
-        breaker = self.breakers.get(upstream_name)
-        if not breaker.allow(now):
-            return finish(503, {"error": "upstream unavailable", "state": breaker.state,
-                                "request_id": request_id})
         request = {"method": method, "path": path, "body": body, "tenant": tenant,
                    "request_id": request_id, "headers": self._upstream_headers(hdrs, route)}
         response = None
         status = TRANSPORT_ERROR
-        while attempts < self.retry_policy.max_attempts:
-            attempts += 1
-            try:
-                response = self.upstreams.call(upstream_name, request, route.timeout_ms)
-                status = int(response["status"])
-            except UpstreamError:
-                response = None
-                status = TRANSPORT_ERROR
-            if not self.retry_policy.should_retry(attempts, status):
+        rejected_state: Optional[str] = None
+        called = False
+        for name in chain:
+            breaker = self.breakers.get(name)
+            if not breaker.allow(now):
+                if rejected_state is None:
+                    rejected_state = breaker.state
+                continue
+            attempt = 0
+            while attempt < self.retry_policy.max_attempts:
+                attempt += 1
+                attempts += 1
+                try:
+                    response = self.upstreams.call(name, request, route.timeout_ms)
+                    status = int(response["status"])
+                except UpstreamError:
+                    response = None
+                    status = TRANSPORT_ERROR
+                if not self.retry_policy.should_retry(attempt, status):
+                    break
+                if self.sleep_fn is not None:
+                    self.sleep_fn(self.retry_policy.delay_ms(attempt))
+            breaker.record(status != TRANSPORT_ERROR and status < 500, now)
+            if attempt:
+                upstream_name = name
+                called = True
+            if status != TRANSPORT_ERROR and status < 500:
                 break
-            if self.sleep_fn is not None:
-                self.sleep_fn(self.retry_policy.delay_ms(attempts))
-        breaker.record(status != TRANSPORT_ERROR and status < 500, now)
+            # Transport error or 5xx after the retry budget: try the next upstream.
 
+        if not called:
+            return finish(503, {"error": "upstream unavailable", "state": rejected_state,
+                                "request_id": request_id})
         if status == TRANSPORT_ERROR:
             return finish(502, {"error": "upstream error", "request_id": request_id,
                                 "upstream": upstream_name})

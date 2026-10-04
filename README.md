@@ -13,7 +13,7 @@ configure.
 ## Running it
 
 ```bash
-# 1. run the test suite (82 tests, no network, no sleeping)
+# 1. run the test suite (103 tests, no network, no sleeping)
 python3 -m unittest discover -s tests -v
 
 # 2. start the gateway
@@ -69,10 +69,16 @@ tests; only the HTTP front end reads the wall clock.
    while resolving a partition (`400`/`401`/`403`) consume no quota, write no
    usage and never call the upstream, but are still audited.
 5. **Idempotency.** See below; a replay short circuits the rest of the pipeline.
-6. **Circuit breaker + retries.** One breaker per upstream name; an open breaker
-   returns `503 {"error":"upstream unavailable","state":"open"}` without calling
-   the upstream. Only `408, 429, 500, 502, 503, 504` and transport errors are
-   retried, bounded by `RetryPolicy(max_attempts, base_ms, max_ms)`.
+6. **Circuit breaker + retries + failover.** One breaker per upstream name; an
+   open breaker returns `503 {"error":"upstream unavailable","state":"open"}`
+   without calling the upstream. Only `408, 429, 500, 502, 503, 504` and
+   transport errors are retried, bounded by `RetryPolicy(max_attempts, base_ms,
+   max_ms)`. When the route names `fallback_upstreams`, a GET request (or any
+   request carrying a non-empty `X-Idempotency-Key`) walks the primary plus the
+   fallbacks in order: each upstream keeps its own retry budget and breaker, a
+   breaker rejection skips it silently, and only a transport error or a 5xx
+   left after the retries moves to the next upstream (see
+   [Fallback upstreams](#fallback-upstreams)).
 7. **Transforms.** `transform.request_headers` are added to the upstream call,
    `transform.response_headers` are added to the reply. Credential headers
    (`Authorization`, `X-Api-Key`) and hop-by-hop headers are stripped before the
@@ -110,6 +116,52 @@ A request carrying `X-Idempotency-Key` is scoped by `(tenant, key)`:
   and never calls the upstream again;
 * the same key with a **different** body hash -> `409`;
 * nothing is stored for `5xx`/transport failures, so a failed call can be retried.
+
+## Fallback upstreams
+
+A route may name `fallback_upstreams`, an ordered array of upstream names tried
+after the primary. Omitting the field (or loading a document written before it
+existed) means `[]`, which keeps the historical single-upstream behaviour. The
+field is validated like every other config field: `null`, a non-array, an entry
+that is not a non-empty string, a duplicate entry or an entry repeating the
+primary upstream all fail with a `GatewayError` (the CLI prints its usual
+single-line JSON error and exits non-zero; a rejected `route-add` changes
+neither the configuration nor any runtime state). The sanitized config returned
+by `GET /v1/config` echoes the field for every route.
+
+Failover is **only** engaged for `GET` requests and requests carrying a
+non-empty `X-Idempotency-Key`; every other request calls the primary upstream
+alone. When engaged, the request walks `[primary] + fallback_upstreams` in
+order after the route has been picked by the usual weighted rule:
+
+* each upstream independently obeys the retry budget and its own circuit
+  breaker — a breaker rejection skips that upstream without calling it;
+* an upstream is called with the usual retry policy; only a transport error
+  (an unregistered upstream counts as one) or a `5xx` status left after the
+  retries moves on to the next upstream — any other status, including a
+  retried `408`/`429`, is returned immediately;
+* every call keeps the original method, path, body, request header transform
+  and credential stripping;
+* when the chain is exhausted, the result of the last upstream actually called
+  is returned: a transport failure is the usual `502`, an HTTP response keeps
+  its status, body and response headers;
+* when every upstream was skipped by its breaker, the response is the usual
+  `503` with `state` taken from the primary upstream's rejection.
+
+The whole request is still charged and recorded **once** at the original quota
+check point — retries and failovers are never billed twice, and auth failures,
+quota rejections and idempotency conflicts/replays never reach an upstream.
+The idempotency cache stores only the final non-`5xx` response; a replay
+short-circuits the pipeline before any failover runs, and a final `5xx` or
+transport failure is never cached. The audit entry stays one line per request:
+`attempts` sums the actual calls across every upstream and `upstream` is the
+last upstream actually called (the primary when none was called).
+
+A valid hot reload applies the new fallback order to new requests only —
+in-flight requests keep the order they started with — and editing
+`fallback_upstreams` resets neither quota buckets nor breaker state. An
+invalid reload keeps the last valid configuration, the quota buckets, the
+breaker states and the existing health feedback.
 
 ## Rate limit algorithms
 
@@ -192,7 +244,8 @@ health state, error feedback and every bucket.
     "auth_required": true, "weight": 1, "scopes": ["read"],
     "transform": {"request_headers": {"X-Tenant": "acme"},
                   "response_headers": {"X-Served-By": "gwd"}},
-    "quota_policy": "p-api", "timeout_ms": 5000
+    "quota_policy": "p-api", "timeout_ms": 5000,
+    "fallback_upstreams": ["echo-dr"]
   }],
   "keys": [{"key_id": "k-1", "tenant": "acme",
             "secret_sha256": "<64 lowercase hex>", "scopes": ["read"]}],
@@ -205,9 +258,12 @@ health state, error feedback and every bucket.
 `scopes` defaults to `[]` (no scope required); a key holding the `*` scope
 satisfies any requirement. `tenant: "*"` marks a route shared by every tenant.
 `partition_by` defaults to `"policy"` and accepts only `"policy"`, `"tenant"`
-and `"key"` (see [Quota partitions](#quota-partitions)). `load()` rejects
+and `"key"` (see [Quota partitions](#quota-partitions)). `fallback_upstreams`
+defaults to `[]` and lists the ordered failover upstreams (see
+[Fallback upstreams](#fallback-upstreams)). `load()` rejects
 malformed documents with `GatewayError` (unknown algorithm, an invalid
-`partition_by`, non-positive `limit`/`window_ms`/`burst`/`weight`,
+`partition_by`, an invalid `fallback_upstreams`, non-positive
+`limit`/`window_ms`/`burst`/`weight`,
 `path_prefix` without a leading `/`, malformed `secret_sha256`, duplicate ids, a
 route naming an unknown quota policy). `reload_if_changed()` re-reads the file
 only when its mtime moved and keeps `ready` true only when the new document is
