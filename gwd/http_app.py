@@ -97,7 +97,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         elif target == "/v1/keys":
             payload = _json_body(raw)
             out = gateway.add_key(payload.get("tenant") or "", payload.get("scopes"),
-                                  payload.get("key_id"))
+                                  payload.get("key_id"), payload.get("enabled"),
+                                  payload.get("expires_at_ms"))
             self._json(201, out, request_id)
         elif target == "/v1/quota/policies":
             self._json(201, gateway.add_policy(_json_body(raw)), request_id)

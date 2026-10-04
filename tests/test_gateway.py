@@ -910,5 +910,215 @@ class MutationTest(unittest.TestCase):
             gateway.add_key("acme", ["read"])
 
 
+class KeyLifecycleTest(GatewayTestCase):
+    """Key disablement and expiry: 401 on protected routes and on key quota
+    partitions, anonymous treatment on other anonymous routes, hot reload
+    flips, and no quota/usage/upstream side effects on rejection."""
+
+    def reload_with(self, **fields):
+        doc = document()
+        doc["keys"][0].update(fields)   # k-read, tenant acme, scope read
+        write_config(self.path, doc)
+        self.assertTrue(self.gateway.reload_config())
+
+    def test_disabled_key_is_401_without_touching_quota_or_upstream(self):
+        self.reload_with(enabled=False)
+        response = self.gateway.handle("acme", "GET", "/api/items", self.auth(), "", now_ms=0)
+        self.assertEqual(response["status"], 401)
+        payload = self.body_of(response)
+        self.assertEqual(payload["error"], "api key disabled")
+        self.assertIn("request_id", payload)
+        self.assertEqual(self.gateway.usage("acme")["requests"], 0)
+        entry = self.gateway.audit("acme", 1)[0]
+        self.assertEqual((entry["status"], entry["attempts"], entry["idempotent_replay"]),
+                         (401, 0, False))
+        self.assertIsNone(entry["key_id"])
+
+    def test_expired_key_is_401_and_equality_means_expired(self):
+        self.reload_with(expires_at_ms=1000)
+        ok = self.gateway.handle("acme", "GET", "/api/items", self.auth(), "", now_ms=999)
+        self.assertEqual(ok["status"], 200)
+        response = self.gateway.handle("acme", "GET", "/api/items", self.auth(), "", now_ms=1000)
+        self.assertEqual(response["status"], 401)
+        self.assertEqual(self.body_of(response)["error"], "api key expired")
+        self.assertIn("request_id", self.body_of(response))
+        self.assertEqual(self.gateway.usage("acme")["requests"], 1)  # only the 200 was charged
+
+    def test_disabled_wins_over_expired(self):
+        self.reload_with(enabled=False, expires_at_ms=1)
+        response = self.gateway.handle("acme", "GET", "/api/items", self.auth(), "", now_ms=5000)
+        self.assertEqual(self.body_of(response)["error"], "api key disabled")
+
+    def test_no_matching_route_is_still_404_for_an_invalid_key(self):
+        self.reload_with(enabled=False)
+        response = self.gateway.handle("acme", "GET", "/nope", self.auth(), "", now_ms=0)
+        self.assertEqual(response["status"], 404)
+
+    def test_anonymous_route_treats_an_invalid_key_as_no_key(self):
+        valid = self.gateway.handle("", "POST", "/count/x", self.auth(), "{}", now_ms=0)
+        self.assertEqual(valid["status"], 200)
+        self.assertEqual(self.gateway.audit("acme", 1)[0]["key_id"], "k-read")
+        self.reload_with(enabled=False)
+        response = self.gateway.handle("", "POST", "/count/x", self.auth(), "{}", now_ms=1)
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(len(self.calls), 2)   # the upstream still ran
+        entry = self.gateway.audit("", 1)[0]
+        # neither the tenant nor the key_id is derived from the disabled key
+        self.assertEqual((entry["status"], entry["tenant"], entry["key_id"]), (200, "", None))
+
+    def test_key_partition_rejects_an_invalid_key_with_401(self):
+        for fields, error, at in (({"enabled": False}, "api key disabled", 0),
+                                  ({"expires_at_ms": 10}, "api key expired", 10)):
+            doc = partition_document()
+            doc["keys"][0].update(fields)
+            gateway, root, _ = make_gateway(doc)
+            self.addCleanup(shutil.rmtree, root, True)
+            response = gateway.handle("", "GET", "/k", self.auth(), "", now_ms=at)
+            self.assertEqual(response["status"], 401)
+            self.assertEqual(self.body_of(response)["error"], error)
+            self.assertIn("request_id", self.body_of(response))
+            self.assertEqual(gateway.usage("")["requests"], 0)
+
+    def test_tenant_partition_without_a_tenant_is_still_400(self):
+        doc = partition_document()
+        doc["keys"][0]["enabled"] = False
+        gateway, root, _ = make_gateway(doc)
+        self.addCleanup(shutil.rmtree, root, True)
+        response = gateway.handle("", "GET", "/to", self.auth(), "", now_ms=0)
+        self.assertEqual(response["status"], 400)
+        self.assertIn("tenant", self.body_of(response)["error"])
+
+    def test_an_invalid_key_cannot_replay_a_stored_idempotent_response(self):
+        headers = dict(self.auth(), **{"x-idempotency-key": "life-idem"})
+        first = self.gateway.handle("acme", "GET", "/api/items", headers, "", now_ms=0)
+        self.assertEqual(first["status"], 200)
+        self.reload_with(enabled=False)
+        rejected = self.gateway.handle("acme", "GET", "/api/items", headers, "", now_ms=1)
+        self.assertEqual(rejected["status"], 401)
+        self.assertNotIn("X-Idempotent-Replay", rejected["headers"])
+        self.reload_with()   # enabled again: quota is checked, then the replay serves
+        replay = self.gateway.handle("acme", "GET", "/api/items", headers, "", now_ms=2)
+        self.assertEqual(replay["status"], 200)
+        self.assertEqual(replay["headers"]["X-Idempotent-Replay"], "true")
+        self.assertEqual(self.gateway.usage("acme")["requests"], 2)  # the 401 was never charged
+
+    def test_disable_and_reenable_keeps_the_quota_bucket(self):
+        for _ in range(2):
+            self.assertEqual(
+                self.gateway.handle("acme", "GET", "/api/items", self.auth(), "", now_ms=0)["status"],
+                200)
+        self.reload_with(enabled=False)
+        self.assertEqual(
+            self.gateway.handle("acme", "GET", "/api/items", self.auth(), "", now_ms=0)["status"],
+            401)
+        self.reload_with()
+        # the bucket was not reset while the key was disabled
+        self.assertEqual(
+            self.gateway.handle("acme", "GET", "/api/items", self.auth(), "", now_ms=0)["status"],
+            429)
+
+    def test_hot_reload_adjusts_expiry_for_later_requests(self):
+        self.reload_with(expires_at_ms=1000)
+        self.assertEqual(
+            self.gateway.handle("acme", "GET", "/api/items", self.auth(), "", now_ms=500)["status"],
+            200)
+        self.reload_with(expires_at_ms=400)
+        self.assertEqual(
+            self.gateway.handle("acme", "GET", "/api/items", self.auth(), "", now_ms=500)["status"],
+            401)
+        self.reload_with()
+        self.assertEqual(
+            self.gateway.handle("acme", "GET", "/api/items", self.auth(), "", now_ms=500)["status"],
+            200)
+
+    def test_add_key_echoes_and_persists_the_new_fields(self):
+        created = self.gateway.add_key("acme", ["read"], key_id="k-temp",
+                                       enabled=False, expires_at_ms=1000)
+        self.assertEqual(created["enabled"], False)
+        self.assertEqual(created["expires_at_ms"], 1000)
+        self.assertIn("secret", created)
+        with open(self.path, "r", encoding="utf-8") as handle:
+            stored = {k["key_id"]: k for k in json.load(handle)["keys"]}["k-temp"]
+        self.assertEqual((stored["enabled"], stored["expires_at_ms"]), (False, 1000))
+        self.assertNotIn(created["secret"], json.dumps(stored))
+        # creating an already-invalid key is allowed; using it is not
+        headers = {"authorization": "Bearer " + created["secret"]}
+        response = self.gateway.handle("acme", "GET", "/api/items", headers, "", now_ms=0)
+        self.assertEqual(response["status"], 401)
+        self.assertEqual(self.body_of(response)["error"], "api key disabled")
+
+    def test_add_key_defaults_to_enabled_and_never_expiring(self):
+        created = self.gateway.add_key("acme", ["read"], key_id="k-plain")
+        self.assertEqual(created["enabled"], True)
+        self.assertIsNone(created["expires_at_ms"])
+
+    def test_add_key_rejects_invalid_fields_without_changing_anything(self):
+        before = json.dumps(self.gateway.sanitized_config(), sort_keys=True)
+        revision = self.gateway.store.revision
+        bad = ({"enabled": "yes"}, {"enabled": 1}, {"enabled": "true"},
+               {"expires_at_ms": 0}, {"expires_at_ms": -5},
+               {"expires_at_ms": True}, {"expires_at_ms": "soon"}, {"expires_at_ms": 1.5})
+        for kwargs in bad:
+            with self.assertRaises(GatewayError, msg=repr(kwargs)) as caught:
+                self.gateway.add_key("acme", ["read"], key_id="k-bad", **kwargs)
+            self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(json.dumps(self.gateway.sanitized_config(), sort_keys=True), before)
+        self.assertEqual(self.gateway.store.revision, revision)
+        with open(self.path, "r", encoding="utf-8") as handle:
+            self.assertNotIn("k-bad", handle.read())
+
+    def test_sanitized_config_echoes_lifecycle_fields_but_never_the_secret(self):
+        self.reload_with(enabled=False, expires_at_ms=1000)
+        keys = {k["key_id"]: k for k in self.gateway.sanitized_config()["keys"]}
+        self.assertEqual(keys["k-read"]["enabled"], False)
+        self.assertEqual(keys["k-read"]["expires_at_ms"], 1000)
+        blob = json.dumps(self.gateway.sanitized_config())
+        self.assertNotIn("secret_sha256", blob)
+        self.assertNotIn(SECRET_READ, blob)
+
+
+class KeyLifecycleConfigTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="gwd-key-config-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.path = os.path.join(self.root, "config.json")
+
+    def base_key(self, **extra):
+        key = {"key_id": "k", "tenant": "t", "secret_sha256": "a" * 64}
+        key.update(extra)
+        return key
+
+    def test_malformed_lifecycle_fields_are_rejected(self):
+        bad = ({"enabled": "yes"}, {"enabled": 1}, {"enabled": 0},
+               {"expires_at_ms": True}, {"expires_at_ms": 0}, {"expires_at_ms": -1},
+               {"expires_at_ms": 1.5}, {"expires_at_ms": "1000"})
+        for extra in bad:
+            write_config(self.path, {"keys": [self.base_key(**extra)]})
+            with self.assertRaises(GatewayError, msg=repr(extra)):
+                load(self.path)
+
+    def test_defaults_round_trip_and_null_expiry_means_never(self):
+        write_config(self.path, {"keys": [self.base_key()]})
+        key = load(self.path).keys[0]
+        self.assertTrue(key.enabled)
+        self.assertIsNone(key.expires_at_ms)
+        self.assertIsNone(key.rejection(10 ** 15))
+        self.assertEqual(key.to_dict()["enabled"], True)
+        self.assertIsNone(key.to_dict()["expires_at_ms"])
+        write_config(self.path, {"keys": [self.base_key(enabled=False, expires_at_ms=None)]})
+        key = load(self.path).keys[0]
+        self.assertFalse(key.enabled)
+        self.assertIsNone(key.expires_at_ms)
+        self.assertEqual(key.rejection(0), "api key disabled")
+
+    def test_rejection_reports_disabled_before_expired(self):
+        write_config(self.path, {"keys": [self.base_key(expires_at_ms=100)]})
+        key = load(self.path).keys[0]
+        self.assertIsNone(key.rejection(99))
+        self.assertEqual(key.rejection(100), "api key expired")
+        key.enabled = False
+        self.assertEqual(key.rejection(100), "api key disabled")
+
+
 if __name__ == "__main__":
     unittest.main()

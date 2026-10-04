@@ -13,7 +13,7 @@ configure.
 ## Running it
 
 ```bash
-# 1. run the test suite (103 tests, no network, no sleeping)
+# 1. run the test suite (123 tests, no network, no sleeping)
 python3 -m unittest discover -s tests -v
 
 # 2. start the gateway
@@ -58,10 +58,12 @@ tests; only the HTTP front end reads the wall clock.
 2. **Weighted pick.** Among candidates the longest `path_prefix` wins. Ties are
    resolved by weighted stable hashing (see below).
 3. **Auth.** Missing or unknown secret -> `401`; a stated `X-Api-Key` that does not
-   match the presented secret -> `401`; key tenant different from the route tenant,
-   or a missing route scope -> `403`. Routes with `"auth_required": false` skip
-   this step. Only `sha256(secret)` is ever stored, and it is compared in constant
-   time.
+   match the presented secret -> `401`; a disabled or expired key -> `401`
+   (`api key disabled` / `api key expired`, see
+   [Key disablement and expiry](#key-disablement-and-expiry)); key tenant
+   different from the route tenant, or a missing route scope -> `403`. Routes
+   with `"auth_required": false` skip this step. Only `sha256(secret)` is ever
+   stored, and it is compared in constant time.
 4. **Quota.** If the route names a `quota_policy`, one unit is charged against
    the partition resolved for that policy (see below). A rejected request gets
    `429` with `policy_id` and `reset_at_ms` plus a `Retry-After` header, and the
@@ -87,6 +89,53 @@ tests; only the HTTP front end reads the wall clock.
    with `at`, `request_id`, `tenant`, `key_id`, `route_id`, `upstream`, `status`,
    `latency_ms`, `attempts`, `quota{policy_id,allowed,remaining}` and
    `idempotent_replay`.
+
+## Key disablement and expiry
+
+Every API key accepts two optional lifecycle fields:
+
+* `enabled` — a boolean, default `true`; any non-boolean value fails validation.
+* `expires_at_ms` — omitted or `null` means the key never expires; any other
+  value must be a positive integer millisecond timestamp (booleans are
+  rejected). A request is expired when `now_ms >= expires_at_ms` — equality
+  already means expired.
+
+Both fields are validated like every other config field: a malformed value
+fails with a `GatewayError` (`400` on `POST /v1/keys`; the CLI exits with its
+usual single-line JSON error), and a rejected creation changes neither the
+configuration, the revision nor any runtime state. `Gateway.add_key` and
+`POST /v1/keys` accept the two fields as optional inputs, echo them on success
+(and may create an already disabled or expired key), and keep the historical
+defaults when they are omitted — `key-add` therefore still creates keys that
+are enabled and never expire. `GET /v1/config` echoes both fields for every
+key while still hiding the plaintext secret and its hash.
+
+The pipeline resolves the credential exactly as before (secret selection,
+sha256 comparison, `X-Api-Key` id check) and only then evaluates the lifecycle
+fields against the request's own `now_ms` (the HTTP front end uses the request
+start time). A key that is both disabled and expired is reported as disabled:
+
+* routes requiring authentication and anonymous routes whose quota policy
+  partitions `by key` reject the request with `401` (`api key disabled` or
+  `api key expired`, keeping the `request_id`) — before any quota is charged,
+  any usage is written, any idempotent response is replayed or any upstream is
+  called; the rejection appends a single audit entry with `attempts: 0` and
+  `idempotent_replay: false`;
+* every other anonymous route treats the request as if no key had been
+  presented: no tenant or `key_id` is derived from the invalid key, the usual
+  anonymous access and tenant partition rules apply (a tenant partition
+  without a tenant is still `400`), and a stored idempotent response is
+  replayed only under the anonymous identity;
+* a request that matches no route is still `404`.
+
+Toggling `enabled` or adjusting `expires_at_ms` through the usual hot reload
+applies to subsequent requests only — requests that already passed
+authentication keep their original retry and failover behaviour — and resets
+neither quota buckets, breaker states nor the idempotency cache, so a
+re-enabled key keeps its previous quota consumption. An invalid reload keeps
+the last valid configuration together with the existing `ready`/`last_error`
+feedback, and config documents written before these fields existed keep keys
+enabled and non-expiring.
 
 ## Weighted routing (documented rule)
 
@@ -209,9 +258,9 @@ partition key is resolved at the original quota check point:
 
 * **tenant mode:** an empty request tenant (no key and no request tenant) is
   `400`.
-* **key mode:** a missing/unknown secret or a claimed `X-Api-Key` that does not
-  match the presented secret is `401`, even when the matched route allows
-  anonymous access (`auth_required: false`).
+* **key mode:** a missing/unknown secret, a claimed `X-Api-Key` that does not
+  match the presented secret, or a disabled/expired key is `401`, even when
+  the matched route allows anonymous access (`auth_required: false`).
 * **both modes:** when a valid key is presented together with an explicit
   request tenant that differs from the key's tenant, the request is `403`.
 

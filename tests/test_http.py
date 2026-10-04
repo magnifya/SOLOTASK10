@@ -190,6 +190,51 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["reset"], ["echo"])
 
+    def test_key_creation_with_lifecycle_fields(self):
+        status, _, payload = self.json_request("POST", "/v1/keys",
+                                               {"tenant": "acme", "scopes": ["read"],
+                                                "enabled": False, "expires_at_ms": 1000})
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["enabled"], False)
+        self.assertEqual(payload["expires_at_ms"], 1000)
+        self.assertIn("secret", payload)
+        status, _, reply = self.json_request("GET", "/api/items",
+                                             headers={"authorization": "Bearer " + payload["secret"]})
+        self.assertEqual(status, 401)
+        self.assertEqual(reply["error"], "api key disabled")
+        self.assertIn("request_id", reply)
+        status, _, config = self.json_request("GET", "/v1/config")
+        created = {k["key_id"]: k for k in config["keys"]}[payload["key_id"]]
+        self.assertEqual((created["enabled"], created["expires_at_ms"]), (False, 1000))
+        self.assertNotIn("secret_sha256", json.dumps(created))
+
+    def test_key_creation_defaults_and_already_expired_keys(self):
+        status, _, payload = self.json_request("POST", "/v1/keys", {"tenant": "acme"})
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["enabled"], True)
+        self.assertIsNone(payload["expires_at_ms"])
+        # creating an already-expired key is allowed; using it is not
+        status, _, expired = self.json_request("POST", "/v1/keys",
+                                               {"tenant": "acme", "scopes": ["read"],
+                                                "expires_at_ms": 1})
+        self.assertEqual(status, 201)
+        status, _, reply = self.json_request("GET", "/api/items",
+                                             headers={"authorization": "Bearer " + expired["secret"]})
+        self.assertEqual(status, 401)
+        self.assertEqual(reply["error"], "api key expired")
+
+    def test_key_creation_rejects_invalid_lifecycle_fields(self):
+        before = self.json_request("GET", "/v1/config")[2]
+        for body in ({"tenant": "acme", "enabled": "yes"},
+                     {"tenant": "acme", "enabled": 1},
+                     {"tenant": "acme", "expires_at_ms": 0},
+                     {"tenant": "acme", "expires_at_ms": -1},
+                     {"tenant": "acme", "expires_at_ms": True}):
+            status, _, reply = self.json_request("POST", "/v1/keys", body)
+            self.assertEqual(status, 400, body)
+            self.assertIn("request_id", reply)
+        self.assertEqual(self.json_request("GET", "/v1/config")[2], before)
+
     def test_unknown_admin_route_falls_through_to_the_proxy(self):
         status, _, payload = self.json_request("GET", "/v1/does-not-exist")
         self.assertEqual(status, 404)

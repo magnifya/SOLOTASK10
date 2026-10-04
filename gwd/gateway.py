@@ -99,12 +99,19 @@ class Gateway:
         return routes[0].to_dict() if len(routes) == 1 else {"routes": [r.to_dict() for r in routes]}
 
     def add_key(self, tenant: str, scopes: Optional[List[str]] = None,
-                key_id: Optional[str] = None) -> Dict[str, Any]:
+                key_id: Optional[str] = None, enabled: Optional[bool] = None,
+                expires_at_ms: Optional[int] = None) -> Dict[str, Any]:
         if not tenant:
             raise GatewayError("tenant is required")
         secret = secrets.token_urlsafe(24)
-        key = ApiKey(key_id=key_id or ("key-" + secrets.token_hex(6)), tenant=tenant,
-                     secret_sha256=sha256_hex(secret), scopes=list(scopes or []))
+        raw: Dict[str, Any] = {"key_id": key_id or ("key-" + secrets.token_hex(6)),
+                               "tenant": tenant, "secret_sha256": sha256_hex(secret),
+                               "scopes": list(scopes or [])}
+        if enabled is not None:
+            raw["enabled"] = enabled
+        if expires_at_ms is not None:
+            raw["expires_at_ms"] = expires_at_ms
+        key = ApiKey.from_dict(raw, "key")   # validates enabled/expires_at_ms
         def mutate(document: Dict[str, Any]) -> None:
             if any(k.get("key_id") == key.key_id for k in document["keys"]):
                 raise GatewayError("api key already exists: %s" % key.key_id)
@@ -163,6 +170,14 @@ class Gateway:
                     "request_id": request_id, "route_id": route.id if route else None}
 
         key, auth_error = self._resolve_key(hdrs)
+        # A resolved key is then checked for disablement/expiry against this
+        # request's clock; a disabled key is reported as disabled even when it
+        # is also expired. An invalid key never derives a tenant or a key_id:
+        # routes that must reject it see ``key_error`` below, every other
+        # anonymous route treats the request as if no key had been presented.
+        key_error = key.rejection(now) if key is not None else None
+        if key_error is not None:
+            key = None
         explicit_tenant = tenant or ""
         tenant = tenant or (key.tenant if key else "")
         candidates = self.config.matching_routes(method, path, tenant)
@@ -177,6 +192,8 @@ class Gateway:
 
         # 2. authentication and authorisation
         if route.auth_required:
+            if key_error:
+                return finish(401, {"error": key_error, "request_id": request_id})
             if auth_error:
                 return finish(401, {"error": auth_error, "request_id": request_id})
             if route.tenant != ANY_TENANT and key.tenant != route.tenant:
@@ -197,9 +214,10 @@ class Gateway:
                 if key is None:
                     if policy.partition_by == "key":
                         # A key partition needs a valid key even on anonymous
-                        # routes: missing secret, unknown secret or a claimed key
-                        # id that does not match the secret are all 401.
-                        return finish(401, {"error": auth_error or "missing api key",
+                        # routes: missing secret, unknown secret, a claimed key
+                        # id that does not match the secret, or a disabled or
+                        # expired key are all 401.
+                        return finish(401, {"error": key_error or auth_error or "missing api key",
                                             "request_id": request_id})
                     if not tenant:
                         return finish(400, {"error": "tenant is required by quota policy %s"

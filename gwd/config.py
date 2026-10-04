@@ -157,6 +157,8 @@ class ApiKey:
     tenant: str
     secret_sha256: str
     scopes: List[str] = field(default_factory=list)
+    enabled: bool = True
+    expires_at_ms: Optional[int] = None
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "key") -> "ApiKey":
@@ -167,18 +169,36 @@ class ApiKey:
         digest = _get(data, "secret_sha256", str, where, required=True)
         if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
             raise GatewayError("%s: secret_sha256 must be 64 lowercase hex characters" % where)
+        # ``expires_at_ms`` omitted or null means the key never expires; any
+        # other value must be a positive integer millisecond timestamp (the
+        # int check in _get already excludes booleans).
+        expires_at_ms = _get(data, "expires_at_ms", int, where)
+        if expires_at_ms is not None and expires_at_ms < 1:
+            raise GatewayError("%s: expires_at_ms must be a positive integer "
+                               "millisecond timestamp" % where)
         return cls(key_id, _get(data, "tenant", str, where, default=ANY_TENANT), digest,
-                   _str_list(data, "scopes", where))
+                   _str_list(data, "scopes", where),
+                   _get(data, "enabled", bool, where, default=True), expires_at_ms)
 
     def allows(self, required: List[str]) -> bool:
         return not required or ANY_SCOPE in self.scopes or set(required).issubset(set(self.scopes))
 
+    def rejection(self, now_ms: int) -> Optional[str]:
+        """Why this key must be rejected at ``now_ms``; disabled wins over expired."""
+        if not self.enabled:
+            return "api key disabled"
+        if self.expires_at_ms is not None and now_ms >= self.expires_at_ms:
+            return "api key expired"
+        return None
+
     def to_dict(self) -> Dict[str, Any]:
         return {"key_id": self.key_id, "tenant": self.tenant, "scopes": list(self.scopes),
-                "secret_sha256": self.secret_sha256}
+                "secret_sha256": self.secret_sha256, "enabled": self.enabled,
+                "expires_at_ms": self.expires_at_ms}
 
     def public(self) -> Dict[str, Any]:
-        return {"key_id": self.key_id, "tenant": self.tenant, "scopes": list(self.scopes)}
+        return {"key_id": self.key_id, "tenant": self.tenant, "scopes": list(self.scopes),
+                "enabled": self.enabled, "expires_at_ms": self.expires_at_ms}
 
 
 @dataclass
