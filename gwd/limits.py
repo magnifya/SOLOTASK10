@@ -62,19 +62,34 @@ class TokenBucket:
         self.tokens = float(capacity)
         self.last_ms: Optional[int] = None
 
-    def allow(self, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
+    def _refilled(self, now_ms: int) -> float:
+        last_ms = self.last_ms if self.last_ms is not None else now_ms
+        return min(self.capacity, self.tokens + max(0, now_ms - last_ms) * self.rate)
+
+    def peek(self, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
+        """Admission result without mutating state (joint admission pre-check)."""
+        now_ms = int(now_ms)
+        tokens = self._refilled(now_ms)
+        allowed = tokens >= cost
+        if allowed:
+            tokens -= cost
+        return {"allowed": allowed, "remaining": max(0, int(tokens)),
+                "reset_at_ms": now_ms + _wait_ms(max(0.0, cost - tokens), self.rate),
+                "algorithm": self.algorithm, "limit": int(self.capacity)}
+
+    def take(self, cost: int = 1, now_ms: int = 0) -> None:
+        """Commit a charge previously confirmed by :meth:`peek`."""
         now_ms = int(now_ms)
         if self.last_ms is None:
             self.last_ms = now_ms
-        elapsed = max(0, now_ms - self.last_ms)
         self.last_ms = max(self.last_ms, now_ms)
-        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
-        allowed = self.tokens >= cost
-        if allowed:
-            self.tokens -= cost
-        return {"allowed": allowed, "remaining": max(0, int(self.tokens)),
-                "reset_at_ms": now_ms + _wait_ms(max(0.0, cost - self.tokens), self.rate),
-                "algorithm": self.algorithm, "limit": int(self.capacity)}
+        self.tokens = self._refilled(now_ms) - cost
+
+    def allow(self, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
+        result = self.peek(cost, now_ms)
+        if result["allowed"]:
+            self.take(cost, now_ms)
+        return result
 
 
 class LeakyBucket:
@@ -92,20 +107,36 @@ class LeakyBucket:
         self.level = 0.0
         self.last_ms: Optional[int] = None
 
-    def allow(self, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
+    def _leaked(self, now_ms: int) -> float:
+        last_ms = self.last_ms if self.last_ms is not None else now_ms
+        return max(0.0, self.level - max(0, now_ms - last_ms) * self.rate)
+
+    def peek(self, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
+        """Admission result without mutating state (joint admission pre-check)."""
+        now_ms = int(now_ms)
+        level = self._leaked(now_ms)
+        allowed = level + cost <= self.capacity
+        if allowed:
+            level += cost
+        # reset_at_ms is when another request of the same cost would fit.
+        need = max(0.0, level + cost - self.capacity)
+        return {"allowed": allowed, "remaining": max(0, int(self.capacity - level)),
+                "reset_at_ms": now_ms + _wait_ms(need, self.rate),
+                "algorithm": self.algorithm, "limit": int(self.capacity)}
+
+    def take(self, cost: int = 1, now_ms: int = 0) -> None:
+        """Commit a charge previously confirmed by :meth:`peek`."""
         now_ms = int(now_ms)
         if self.last_ms is None:
             self.last_ms = now_ms
-        elapsed = max(0, now_ms - self.last_ms)
         self.last_ms = max(self.last_ms, now_ms)
-        self.level = max(0.0, self.level - elapsed * self.rate)
-        allowed = self.level + cost <= self.capacity
-        if allowed:
-            self.level += cost
-        need = max(0.0, self.level + cost - self.capacity)
-        return {"allowed": allowed, "remaining": max(0, int(self.capacity - self.level)),
-                "reset_at_ms": now_ms + _wait_ms(need, self.rate),
-                "algorithm": self.algorithm, "limit": int(self.capacity)}
+        self.level = self._leaked(now_ms) + cost
+
+    def allow(self, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
+        result = self.peek(cost, now_ms)
+        if result["allowed"]:
+            self.take(cost, now_ms)
+        return result
 
 
 class SlidingWindow:
@@ -118,22 +149,42 @@ class SlidingWindow:
         self.window_ms = int(window_ms)
         self.stamps: Deque[int] = deque()
 
-    def allow(self, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
+    def _active(self, now_ms: int) -> Deque[int]:
+        cutoff = now_ms - self.window_ms
+        active = deque(self.stamps)
+        while active and active[0] <= cutoff:
+            active.popleft()
+        return active
+
+    def peek(self, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
+        """Admission result without mutating state (joint admission pre-check)."""
+        now_ms = int(now_ms)
+        active = self._active(now_ms)
+        allowed = len(active) + cost <= self.limit
+        if allowed:
+            active.extend([now_ms] * cost)
+        remaining = max(0, self.limit - len(active))
+        if remaining >= cost:
+            reset_at_ms = now_ms
+        else:  # the (cost - remaining)-th oldest stamp has to expire first
+            index = max(0, min(len(active) - self.limit + cost - 1, len(active) - 1))
+            reset_at_ms = active[index] + self.window_ms
+        return {"allowed": allowed, "remaining": remaining, "reset_at_ms": reset_at_ms,
+                "algorithm": self.algorithm, "limit": self.limit}
+
+    def take(self, cost: int = 1, now_ms: int = 0) -> None:
+        """Commit a charge previously confirmed by :meth:`peek`."""
         now_ms = int(now_ms)
         cutoff = now_ms - self.window_ms
         while self.stamps and self.stamps[0] <= cutoff:
             self.stamps.popleft()
-        allowed = len(self.stamps) + cost <= self.limit
-        if allowed:
-            self.stamps.extend([now_ms] * cost)
-        remaining = max(0, self.limit - len(self.stamps))
-        if remaining >= cost:
-            reset_at_ms = now_ms
-        else:  # the (cost - remaining)-th oldest stamp has to expire first
-            index = max(0, min(len(self.stamps) - self.limit + cost - 1, len(self.stamps) - 1))
-            reset_at_ms = self.stamps[index] + self.window_ms
-        return {"allowed": allowed, "remaining": remaining, "reset_at_ms": reset_at_ms,
-                "algorithm": self.algorithm, "limit": self.limit}
+        self.stamps.extend([now_ms] * cost)
+
+    def allow(self, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
+        result = self.peek(cost, now_ms)
+        if result["allowed"]:
+            self.take(cost, now_ms)
+        return result
 
 
 def make_bucket(policy: QuotaPolicy):
@@ -209,6 +260,48 @@ class Limiter:
             result = self.bucket(policy_id, part).allow(cost, now_ms)
         result["policy_id"] = policy_id
         return result
+
+    def allow_group(self, targets: List[tuple], cost: int, now_ms: int) -> List[Dict[str, Any]]:
+        """Joint admission for an ordered list of ``(policy_id, partition)``.
+
+        Every bucket is inspected under the single limiter lock; the group is
+        admitted only when every bucket admits, in which case each is charged
+        exactly ``cost``. When at least one rejects, no bucket changes, so a
+        concurrent request can never see a partially charged group or exceed a
+        limit. Results keep declaration order and carry ``policy_id``; the
+        shared group verdict overwrites each entry's individual ``allowed``.
+        """
+        with self._lock:
+            resolved = []
+            for policy_id, partition in targets:
+                part = POLICY_PARTITION if partition is None else partition
+                resolved.append((policy_id, self.bucket(policy_id, part)))
+            peeks = [bucket.peek(cost, now_ms) for _, bucket in resolved]
+            individual = [bool(result["allowed"]) for result in peeks]
+            group_allowed = all(individual)
+            if group_allowed:
+                for _, bucket in resolved:
+                    bucket.take(cost, now_ms)
+            results = []
+            for (policy_id, _), result in zip(resolved, peeks):
+                result["allowed"] = group_allowed
+                result["policy_id"] = policy_id
+                results.append(result)
+            if not group_allowed:
+                # Nothing was deducted: report each bucket's still-available
+                # capacity, even for buckets that individually had room.
+                for result, (_, bucket) in zip(results, resolved):
+                    result["remaining"] = bucket.peek(0, now_ms)["remaining"]
+            first_reject = next((i for i, ok in enumerate(individual) if not ok), None)
+            if group_allowed or first_reject is None:
+                reset_at_ms = now_ms
+            else:
+                # The client may retry only once every insufficient bucket has
+                # recovered, hence the maximum of their recovery timestamps.
+                reset_at_ms = max(peeks[i]["reset_at_ms"]
+                                  for i, ok in enumerate(individual) if not ok)
+            return {"allowed": group_allowed, "results": results,
+                    "first_reject": first_reject, "reset_at_ms": reset_at_ms}
 
 
 class QuotaLedger:

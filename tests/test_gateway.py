@@ -1065,6 +1065,339 @@ class FallbackConfigTest(unittest.TestCase):
             self.assertNotIn("r-bad", handle.read())
 
 
+def joint_document():
+    """Two policies constrain one request: a tenant total and a per-key budget."""
+    return {
+        "quota_policies": [
+            {"id": "p-tenant", "tenant": "*", "algorithm": "token-bucket",
+             "limit": 3, "window_ms": 60000, "burst": 3, "partition_by": "tenant"},
+            {"id": "p-key", "tenant": "*", "algorithm": "token-bucket",
+             "limit": 2, "window_ms": 60000, "burst": 2, "partition_by": "key"},
+            {"id": "p-policy", "tenant": "*", "algorithm": "sliding-window",
+             "limit": 5, "window_ms": 60000}],
+        "keys": [
+            {"key_id": "k-read", "tenant": "acme", "secret_sha256": sha(SECRET_READ),
+             "scopes": ["read"]},
+            {"key_id": "k-other", "tenant": "acme", "secret_sha256": sha(SECRET_OTHER),
+             "scopes": ["read"]},
+            {"key_id": "k-globex", "tenant": "globex", "secret_sha256": sha(SECRET_GLOBEX),
+             "scopes": ["read"]}],
+        "routes": [
+            {"id": "r-joint", "tenant": "*", "match": {"method": "GET", "path_prefix": "/j"},
+             "upstream": "echo", "scopes": ["read"],
+             "quota_policies": ["p-tenant", "p-key"]},
+            {"id": "r-open", "tenant": "*", "match": {"method": "GET", "path_prefix": "/jo"},
+             "upstream": "echo", "auth_required": False,
+             "quota_policies": ["p-tenant", "p-key"]},
+            {"id": "r-triple", "tenant": "*", "match": {"method": "GET", "path_prefix": "/jt"},
+             "upstream": "echo", "scopes": ["read"],
+             "quota_policies": ["p-tenant", "p-key", "p-policy"]},
+            {"id": "r-single", "tenant": "*", "match": {"method": "GET", "path_prefix": "/js"},
+             "upstream": "echo", "scopes": ["read"], "quota_policy": "p-key"},
+            {"id": "r-jpost", "tenant": "*", "match": {"method": "POST", "path_prefix": "/jp"},
+             "upstream": "echo", "scopes": ["read"],
+             "quota_policies": ["p-tenant", "p-key"]}],
+    }
+
+
+class JointQuotaTest(unittest.TestCase):
+    def setUp(self):
+        self.gateway, self.root, self.path = make_gateway(
+            joint_document(),
+            breaker_settings={"failure_threshold": 1, "open_ms": 1000, "success_threshold": 1})
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.calls = []
+
+        def counting(request):
+            self.calls.append(request)
+            return {"status": 200, "body": {"n": len(self.calls)}}
+
+        self.gateway.upstreams.register("echo", counting)
+
+    def key(self, secret=SECRET_READ):
+        return {"authorization": "Bearer " + secret}
+
+    def body_of(self, response):
+        return json.loads(response["body"])
+
+    def reload(self, doc):
+        write_config(self.path, doc)
+        return self.gateway.reload_config()
+
+    def test_both_policies_admit_then_the_tighter_one_rejects(self):
+        for expected in (200, 200):
+            response = self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=0)
+            self.assertEqual(response["status"], expected)
+        # the key budget (2) is tighter than the tenant budget (3): rejected
+        self.assertEqual(self.gateway.handle("acme", "GET", "/j/x", self.key(), "",
+                                             now_ms=0)["status"], 429)
+        self.assertEqual(len(self.calls), 2)
+        # another key still shares the tenant partition, which has one unit left
+        response = self.gateway.handle("acme", "GET", "/j/x", self.key(SECRET_OTHER), "",
+                                       now_ms=0)
+        self.assertEqual(response["status"], 200)
+        self.assertEqual(len(self.calls), 3)
+        # tenant budget is now exhausted for every key
+        response = self.gateway.handle("acme", "GET", "/j/x", self.key(SECRET_OTHER), "",
+                                       now_ms=0)
+        self.assertEqual(response["status"], 429)
+        payload = self.body_of(response)
+        self.assertEqual(payload["policy_id"], "p-tenant")  # first insufficient in order
+        self.assertEqual(len(self.calls), 3)
+
+    def test_rejection_points_at_the_first_insufficient_policy_in_declaration_order(self):
+        # exhaust the tenant policy (3) from another key first
+        self.gateway.handle("acme", "GET", "/j/x", self.key(SECRET_OTHER), "", now_ms=0)
+        self.gateway.handle("acme", "GET", "/j/x", self.key(SECRET_OTHER), "", now_ms=0)
+        # one more from that key is denied by its own key budget ...
+        self.assertEqual(self.gateway.handle("acme", "GET", "/j/x", self.key(SECRET_OTHER), "",
+                                             now_ms=0)["status"], 429)
+        # ... so use the read key (fresh key partition) for the last tenant unit
+        self.assertEqual(self.gateway.handle("acme", "GET", "/j/x", self.key(), "",
+                                             now_ms=0)["status"], 200)
+        response = self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=0)
+        self.assertEqual(response["status"], 429)
+        self.assertEqual(self.body_of(response)["policy_id"], "p-tenant")
+
+    def test_reset_at_ms_is_the_maximum_over_insufficient_policies(self):
+        # p-tenant limit 3 (reset 20000 per token), p-key limit 2 (30000).
+        for _ in range(2):
+            self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=0)
+        # read key has 2/2 used; other key shares tenant (2/3 used there).
+        self.gateway.handle("acme", "GET", "/j/x", self.key(SECRET_OTHER), "", now_ms=0)
+        # now both policies are exhausted for the read key: tenant 3/3, key 2/2
+        response = self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=0)
+        self.assertEqual(response["status"], 429)
+        payload = self.body_of(response)
+        self.assertEqual(payload["policy_id"], "p-tenant")
+        # p-tenant next token at 20000, p-key at 30000 -> the maximum wins
+        self.assertEqual(payload["reset_at_ms"], 30000)
+        self.assertEqual(response["headers"]["Retry-After"], "30")
+
+    def test_each_joint_check_writes_one_usage_record_per_policy(self):
+        for _ in range(2):
+            self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=0)
+        self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=0)  # rejected
+        entries = self.gateway.ledger.entries("acme")
+        self.assertEqual([e["policy_id"] for e in entries],
+                         ["p-tenant", "p-key", "p-tenant", "p-key", "p-tenant", "p-key"])
+        self.assertTrue(all(e["cost"] == 1 for e in entries))
+        # the group verdict is replicated on every record of the check
+        self.assertEqual([e["allowed"] for e in entries],
+                         [True, True, True, True, False, False])
+        usage = self.gateway.usage("acme")
+        self.assertEqual(usage["requests"], 6)            # one record per policy
+        self.assertEqual(usage["allowed"], 4)
+        self.assertEqual(usage["rejected"], 2)
+        self.assertEqual(usage["allowed_cost"], 4)        # only admitted records
+        self.assertEqual(usage["by_policy"]["p-tenant"]["requests"], 3)
+        self.assertEqual(usage["by_policy"]["p-key"]["rejected"], 1)
+
+    def test_audit_carries_the_ordered_quotas_list_and_quota_is_the_first_item(self):
+        self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=1234)
+        entry = self.gateway.audit("acme", 1)[0]
+        self.assertEqual(entry["quota"],
+                         {"policy_id": "p-tenant", "allowed": True, "remaining": 2})
+        self.assertEqual(entry["quotas"], [
+            {"policy_id": "p-tenant", "allowed": True, "remaining": 2},
+            {"policy_id": "p-key", "allowed": True, "remaining": 1}])
+        self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=0)
+        self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=0)  # rejected
+        rejected = self.gateway.audit("acme", 3)[-1]
+        self.assertFalse(rejected["quota"]["allowed"])
+        self.assertEqual([q["policy_id"] for q in rejected["quotas"]], ["p-tenant", "p-key"])
+        # remaining is the un-deducted availability: p-tenant still 1, p-key 0
+        by_id = {q["policy_id"]: q for q in rejected["quotas"]}
+        self.assertEqual(by_id["p-tenant"]["remaining"], 1)
+        self.assertEqual(by_id["p-key"]["remaining"], 0)
+
+    def test_identity_is_checked_in_declaration_order_after_auth(self):
+        # anonymous on the open joint route: p-tenant (first) needs a tenant
+        missing_tenant = self.gateway.handle("", "GET", "/jo/x", {}, "", now_ms=0)
+        self.assertEqual(missing_tenant["status"], 400)
+        self.assertEqual(len(self.calls), 0)
+        entry = self.gateway.audit("", 1)[0]
+        self.assertEqual(entry["quotas"], [])      # joint check never ran
+        self.assertEqual(entry["quota"],
+                         {"policy_id": None, "allowed": True, "remaining": None})
+        # an explicit tenant gets past the tenant partition; p-key then needs a key
+        missing_key = self.gateway.handle("acme", "GET", "/jo/x", {}, "", now_ms=0)
+        self.assertEqual(missing_key["status"], 401)
+        self.assertEqual(len(self.calls), 0)
+        self.assertEqual(self.gateway.usage("acme")["requests"], 0)
+        self.assertEqual(self.gateway.audit("acme", 1)[0]["quotas"], [])
+
+    def test_explicit_tenant_mismatch_is_403_before_any_charge(self):
+        response = self.gateway.handle("globex", "GET", "/j/x", self.key(), "", now_ms=0)
+        self.assertEqual(response["status"], 403)
+        self.assertEqual(len(self.calls), 0)
+        self.assertEqual(self.gateway.usage("globex")["requests"], 0)
+        self.assertEqual(self.gateway.usage("acme")["requests"], 0)
+
+    def test_idempotent_replay_checks_the_whole_group_each_time(self):
+        headers = dict(self.key(), **{"x-idempotency-key": "joint-idem"})
+        first = self.gateway.handle("acme", "GET", "/j/x", headers, "", now_ms=0)
+        self.assertEqual(first["status"], 200)
+        replay = self.gateway.handle("acme", "GET", "/j/x", headers, "", now_ms=1)
+        self.assertEqual(replay["status"], 200)
+        self.assertEqual(replay["headers"]["X-Idempotent-Replay"], "true")
+        self.assertEqual(len(self.calls), 1)
+        # both replays were charged against both policies (two units each)
+        throttled = self.gateway.handle("acme", "GET", "/j/x", headers, "", now_ms=2)
+        self.assertEqual(throttled["status"], 429)
+        self.assertEqual(self.body_of(throttled)["policy_id"], "p-key")
+
+    def test_idempotent_conflict_is_409_after_quota_is_checked(self):
+        headers = dict(self.key(), **{"x-idempotency-key": "joint-conf"})
+        self.gateway.handle("acme", "POST", "/jp/x", headers, '{"a": 1}', now_ms=0)
+        # quota is checked before the conflict; both buckets still have room so
+        # the different body surfaces as the usual 409
+        conflict = self.gateway.handle("acme", "POST", "/jp/x", headers, '{"a": 2}', now_ms=1)
+        self.assertEqual(conflict["status"], 409)
+
+    def test_single_policy_route_keeps_the_original_audit_shape(self):
+        self.gateway.handle("acme", "GET", "/js/x", self.key(), "", now_ms=0)
+        entry = self.gateway.audit("acme", 1)[0]
+        self.assertEqual(entry["quota"],
+                         {"policy_id": "p-key", "allowed": True, "remaining": 1})
+        self.assertNotIn("quotas", entry)
+
+    def test_three_policies_including_policy_partition(self):
+        for i in range(2):
+            self.assertEqual(self.gateway.handle("acme", "GET", "/jt/x", self.key(), "",
+                                                 now_ms=0)["status"], 200)
+        response = self.gateway.handle("acme", "GET", "/jt/x", self.key(), "", now_ms=0)
+        self.assertEqual(response["status"], 429)
+        self.assertEqual(self.body_of(response)["policy_id"], "p-key")
+        entry = self.gateway.audit("acme", 3)[-1]
+        self.assertEqual([q["policy_id"] for q in entry["quotas"]],
+                         ["p-tenant", "p-key", "p-policy"])
+
+    def test_valid_hot_reload_that_only_changes_the_combination_keeps_state(self):
+        for _ in range(2):
+            self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=0)
+        self.assertEqual(self.gateway.handle("acme", "GET", "/j/x", self.key(), "",
+                                             now_ms=0)["status"], 429)
+        doc = joint_document()
+        # reorder / drop a policy: buckets of the surviving policies are kept
+        doc["routes"][0]["quota_policies"] = ["p-key", "p-tenant"]
+        self.assertTrue(self.reload(doc))
+        response = self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=0)
+        self.assertEqual(response["status"], 429)
+        self.assertEqual(self.body_of(response)["policy_id"], "p-key")  # new first
+        entry = self.gateway.audit("acme", 1)[0]
+        self.assertEqual([q["policy_id"] for q in entry["quotas"]], ["p-key", "p-tenant"])
+
+    def test_invalid_hot_reload_keeps_the_last_combination_and_state(self):
+        self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=0)
+        doc = joint_document()
+        doc["routes"][0]["quota_policies"] = ["p-tenant", "ghost"]
+        write_config(self.path, doc)
+        self.assertFalse(self.gateway.reload_config())
+        self.assertFalse(self.gateway.store.ready)
+        self.assertIn("ghost", self.gateway.store.last_error)
+        # the old combination is still enforced with its surviving bucket state
+        response = self.gateway.handle("acme", "GET", "/j/x", self.key(), "", now_ms=0)
+        self.assertEqual(response["status"], 200)
+        entry = self.gateway.audit("acme", 1)[0]
+        self.assertEqual([q["policy_id"] for q in entry["quotas"]], ["p-tenant", "p-key"])
+
+
+class JointQuotaConfigTest(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="gwd-joint-config-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.path = os.path.join(self.root, "config.json")
+
+    def policy_doc(self, route):
+        return {"routes": [route], "keys": [],
+                "quota_policies": [
+                    {"id": "pa", "algorithm": "token-bucket", "limit": 1, "window_ms": 1},
+                    {"id": "pb", "algorithm": "token-bucket", "limit": 1, "window_ms": 1}]}
+
+    def route(self, **extra):
+        base = {"id": "r", "match": {"method": "GET", "path_prefix": "/a"},
+                "upstream": "echo"}
+        base.update(extra)
+        return base
+
+    def test_malformed_quota_policies_are_rejected(self):
+        cases = {
+            "null": None,
+            "empty array": [],
+            "not an array": "pa",
+            "non-string entry": ["pa", 1],
+            "empty string entry": ["pa", ""],
+            "duplicate entry": ["pa", "pa"],
+            "unknown policy": ["pa", "ghost"],
+            "together with quota_policy": ["pb"],
+        }
+        for label, value in cases.items():
+            route = self.route()
+            if label == "together with quota_policy":
+                route["quota_policy"] = "pa"
+            route["quota_policies"] = value
+            write_config(self.path, self.policy_doc(route))
+            with self.assertRaises(GatewayError, msg=label):
+                load(self.path)
+
+    def test_omitted_field_keeps_the_single_policy_semantics_and_output(self):
+        write_config(self.path, self.policy_doc(self.route(quota_policy="pa")))
+        route = load(self.path).routes[0]
+        self.assertIsNone(route.quota_policies)
+        self.assertEqual(route.quota_policy_ids(), ["pa"])
+        self.assertNotIn("quota_policies", route.to_dict())
+        write_config(self.path, self.policy_doc(self.route()))
+        route = load(self.path).routes[0]
+        self.assertEqual(route.quota_policy_ids(), [])
+        self.assertNotIn("quota_policies", route.to_dict())
+
+    def test_quota_policies_round_trip_and_echo_in_order(self):
+        write_config(self.path, self.policy_doc(self.route(quota_policies=["pb", "pa"])))
+        route = load(self.path).routes[0]
+        self.assertEqual(route.quota_policies, ["pb", "pa"])
+        self.assertEqual(route.quota_policy_ids(), ["pb", "pa"])
+        self.assertIsNone(route.quota_policy)
+        self.assertEqual(route.to_dict()["quota_policies"], ["pb", "pa"])
+
+    def test_route_add_validates_like_load_and_batch_is_atomic(self):
+        gateway, root, path = make_gateway()
+        self.addCleanup(shutil.rmtree, root, True)
+        gateway.add_policy({"id": "pa", "algorithm": "token-bucket", "limit": 1, "window_ms": 1})
+        before = json.dumps(gateway.sanitized_config(), sort_keys=True)
+        revision = gateway.store.revision
+        good = {"id": "r-ok", "tenant": "acme",
+                "match": {"method": "GET", "path_prefix": "/ok"},
+                "upstream": "echo", "quota_policies": ["pa"]}
+        bad = {"id": "r-bad", "tenant": "acme",
+               "match": {"method": "GET", "path_prefix": "/bad"},
+               "upstream": "echo", "quota_policies": ["pa", "ghost"]}
+        with self.assertRaises(GatewayError):
+            gateway.add_route([good, bad])
+        # the whole batch is discarded: revision, config and file are unchanged
+        self.assertEqual(gateway.store.revision, revision)
+        self.assertEqual(json.dumps(gateway.sanitized_config(), sort_keys=True), before)
+        with open(path, "r", encoding="utf-8") as handle:
+            self.assertNotIn("r-ok", handle.read())
+        # a valid batch writes all of it and bumps the revision
+        other = dict(good, id="r-ok2", match={"method": "GET", "path_prefix": "/ok2"})
+        gateway.add_route([good, other])
+        self.assertEqual(gateway.store.revision, revision + 1)
+        ids = {r["id"] for r in gateway.sanitized_config()["routes"]}
+        self.assertEqual(ids & {"r-ok", "r-ok2"}, {"r-ok", "r-ok2"})
+
+    def test_route_add_rejects_coexistence_without_changing_state(self):
+        gateway, root, _ = make_gateway()
+        self.addCleanup(shutil.rmtree, root, True)
+        before = json.dumps(gateway.sanitized_config(), sort_keys=True)
+        with self.assertRaises(GatewayError):
+            gateway.add_route({"id": "r-x", "tenant": "acme",
+                               "match": {"method": "GET", "path_prefix": "/x"},
+                               "upstream": "echo", "quota_policy": "p-fast",
+                               "quota_policies": ["p-fast"]})
+        self.assertEqual(json.dumps(gateway.sanitized_config(), sort_keys=True), before)
+
+
 class MutationTest(unittest.TestCase):
     def setUp(self):
         self.gateway, self.root, self.path = make_gateway()

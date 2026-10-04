@@ -13,7 +13,7 @@ configure.
 ## Running it
 
 ```bash
-# 1. run the test suite (117 tests, no network, no sleeping)
+# 1. run the test suite (142 tests, no network, no sleeping)
 python3 -m unittest discover -s tests -v
 
 # 2. start the gateway
@@ -65,11 +65,15 @@ tests; only the HTTP front end reads the wall clock.
    `"auth_required": false` skip this step. Only `sha256(secret)` is ever stored,
    and it is compared in constant time.
 4. **Quota.** If the route names a `quota_policy`, one unit is charged against
-   the partition resolved for that policy (see below). A rejected request gets
-   `429` with `policy_id` and `reset_at_ms` plus a `Retry-After` header, and the
-   *rejected attempt is still written to the ledger*. Identity rejections raised
-   while resolving a partition (`400`/`401`/`403`) consume no quota, write no
-   usage and never call the upstream, but are still audited.
+   the partition resolved for that policy (see below). A route may instead name
+   `quota_policies`, an ordered, non-empty array of policy ids: one request is
+   then jointly admitted against every policy and charged one unit against each
+   (see [Joint quota admission](#joint-quota-admission)). A rejected request
+   gets `429` with `policy_id` and `reset_at_ms` plus a `Retry-After` header,
+   and the *rejected attempt is still written to the ledger* (one record per
+   policy on joint routes). Identity rejections raised while resolving a
+   partition (`400`/`401`/`403`) consume no quota, write no usage and never
+   call the upstream, but are still audited.
 5. **Idempotency.** See below; a replay short circuits the rest of the pipeline.
 6. **Circuit breaker + retries + failover.** One breaker per upstream name; an
    open breaker returns `503 {"error":"upstream unavailable","state":"open"}`
@@ -88,7 +92,10 @@ tests; only the HTTP front end reads the wall clock.
 8. **Audit.** One JSON line per request is appended to `<data-dir>/audit.jsonl`
    with `at`, `request_id`, `tenant`, `key_id`, `route_id`, `upstream`, `status`,
    `latency_ms`, `attempts`, `quota{policy_id,allowed,remaining}` and
-   `idempotent_replay`.
+   `idempotent_replay`. A joint-admission route additionally carries `quotas`,
+   an ordered list of `{policy_id,allowed,remaining}` (see
+   [Joint quota admission](#joint-quota-admission)); single-policy routes keep
+   the historical shape with no `quotas` field.
 
 ## Weighted routing (documented rule)
 
@@ -277,6 +284,64 @@ policy's partitions from their initial state; removing the policy and adding it
 back also starts fresh. An invalid reload keeps the previous configuration,
 health state, error feedback and every bucket.
 
+## Joint quota admission
+
+A route names exactly one way to be governed:
+
+* `"quota_policy": "p-a"` — the historical single policy;
+* `"quota_policies": ["p-tenant", "p-key"]` — an ordered, non-empty array for
+  joint admission;
+* neither — no quota.
+
+`quota_policies` is validated like every other config field: omitting it keeps
+the `quota_policy` semantics, while `null`, an empty array, a non-array, a
+non-string or empty-string entry, a duplicate entry, an unknown policy id, or
+setting a non-empty `quota_policy` at the same time all fail with a
+`GatewayError`. The same validation runs for `load()`, `route-add` (an invalid
+item in a batch rejects the whole batch: nothing is written and the revision is
+unchanged) and hot reload. `GET /v1/config` echoes `quota_policies` only on
+routes that set it, so older routes keep their exact output.
+
+`Gateway.handle` and the HTTP proxy apply identical rules. After the existing
+authentication step, partition identity is resolved for each policy **in
+declaration order**, and the first failure decides the response: a tenant
+partition without a tenant is `400`, a key partition without a valid key is
+`401`, and an explicit request tenant that differs from a valid key's tenant is
+`403` — all without consuming quota, writing usage or calling the upstream.
+
+Once every identity resolves, the units are admitted **atomically**:
+
+* every named policy admits one unit, or none of them does — there is no partial
+  charge even under concurrency in the same partitions;
+* when all admit, each policy is charged one unit;
+* when at least one is insufficient the response is `429`, `policy_id` points at
+  the **first** insufficient policy in declaration order, `reset_at_ms` is the
+  **maximum** recovery timestamp over the insufficient policies, and
+  `Retry-After` uses the existing conversion.
+
+All three algorithms and all three partition modes participate; the whole
+peek-then-commit sequence runs under the limiter's single lock, so concurrent
+requests on the same partitions can never partially charge or exceed a limit.
+
+The usage ledger keeps its format: a joint check appends **one record per
+policy** (`cost` 1, existing fields), and `allowed` is the group verdict
+replicated onto each record. Aggregation is unchanged, so `requests` counts the
+records (one per policy per request) and `allowed_cost` counts only admitted
+records. The audit trail still gets one line per request; joint routes add an
+ordered `quotas` array of `{policy_id, allowed, remaining}` while `quota` equals
+its first item. On rejection `remaining` is the still-available, un-deducted
+capacity; when the request fails before the joint check (auth or partition
+identity), `quotas` is `[]` and `quota` keeps its unchecked value
+`{policy_id: null, allowed: true, remaining: null}`.
+
+An idempotent replay and an idempotency conflict still check quota first, so
+replays are re-admitted against every policy and conflicts are billed like any
+other admitted request. Retries, fallback upstreams and the circuit breaker
+charge the group exactly once. A valid hot reload that only edits the route's
+combination preserves quota buckets, breaker state and the idempotency cache
+(in-flight requests keep the combination they started with); an invalid reload
+keeps the previous configuration, state and health feedback.
+
 ## Configuration
 
 ```json
@@ -290,13 +355,22 @@ health state, error feedback and every bucket.
                   "response_headers": {"X-Served-By": "gwd"}},
     "quota_policy": "p-api", "timeout_ms": 5000,
     "fallback_upstreams": ["echo-dr"]
+  }, {
+    "id": "r-both", "tenant": "acme",
+    "match": {"method": "GET", "path_prefix": "/both"},
+    "upstream": "echo", "auth_required": true, "weight": 1, "scopes": ["read"],
+    "quota_policies": ["p-tenant-total", "p-key-budget"]
   }],
   "keys": [{"key_id": "k-1", "tenant": "acme",
             "secret_sha256": "<64 lowercase hex>", "scopes": ["read"],
             "enabled": true, "expires_at_ms": null}],
   "quota_policies": [{"id": "p-api", "tenant": "acme", "algorithm": "token-bucket",
                       "limit": 10, "window_ms": 1000, "burst": 20,
-                      "partition_by": "tenant"}]
+                      "partition_by": "tenant"},
+                     {"id": "p-tenant-total", "tenant": "*", "algorithm": "token-bucket",
+                      "limit": 100, "window_ms": 1000, "partition_by": "tenant"},
+                     {"id": "p-key-budget", "tenant": "*", "algorithm": "token-bucket",
+                      "limit": 10, "window_ms": 1000, "partition_by": "key"}]
 }
 ```
 
@@ -307,10 +381,14 @@ satisfies any requirement. `tenant: "*"` marks a route shared by every tenant.
 `partition_by` defaults to `"policy"` and accepts only `"policy"`, `"tenant"`
 and `"key"` (see [Quota partitions](#quota-partitions)). `fallback_upstreams`
 defaults to `[]` and lists the ordered failover upstreams (see
-[Fallback upstreams](#fallback-upstreams)). `load()` rejects
+[Fallback upstreams](#fallback-upstreams)). `quota_policies` is omitted by
+default and, when present, must be an ordered, non-empty array of known,
+distinct policy ids used instead of `quota_policy` (see
+[Joint quota admission](#joint-quota-admission)). `load()` rejects
 malformed documents with `GatewayError` (unknown algorithm, an invalid
-`partition_by`, an invalid `fallback_upstreams`, a non-boolean `enabled`, an
-invalid `expires_at_ms`, non-positive
+`partition_by`, an invalid `fallback_upstreams`, an invalid `quota_policies`,
+a non-boolean `enabled`, an invalid
+`expires_at_ms`, non-positive
 `limit`/`window_ms`/`burst`/`weight`,
 `path_prefix` without a leading `/`, malformed `secret_sha256`, duplicate ids, a
 route naming an unknown quota policy). `reload_if_changed()` re-reads the file

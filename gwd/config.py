@@ -76,6 +76,26 @@ def _fallback_list(data: Dict[str, Any], key: str, where: str, primary: str) -> 
     return out
 
 
+def _quota_policy_list(data: Dict[str, Any], key: str, where: str) -> Optional[List[str]]:
+    """Ordered quota policies for joint admission: omitted means absent, while
+    null/non-array and any non-string, empty or duplicated entry is rejected."""
+    if key not in data:
+        return None
+    raw = data[key]
+    if not isinstance(raw, list):
+        raise GatewayError("%s: %r must be an array of quota policy ids" % (where, key))
+    if not raw:
+        raise GatewayError("%s: %r must be a non-empty array" % (where, key))
+    out: List[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item:
+            raise GatewayError("%s: %r entries must be non-empty quota policy ids" % (where, key))
+        if item in out:
+            raise GatewayError("%s: duplicate quota policy %r" % (where, item))
+        out.append(item)
+    return out
+
+
 def _unique(items: List[Any], pick: Callable[[Any], str], label: str) -> None:
     seen = set()
     for item in items:
@@ -98,6 +118,7 @@ class Route:
     request_headers: Dict[str, str] = field(default_factory=dict)
     response_headers: Dict[str, str] = field(default_factory=dict)
     quota_policy: Optional[str] = None
+    quota_policies: Optional[List[str]] = None
     timeout_ms: int = 5000
     scopes: List[str] = field(default_factory=list)
     fallback_upstreams: List[str] = field(default_factory=list)
@@ -119,6 +140,13 @@ class Route:
             raise GatewayError("%s: weight and timeout_ms must be >= 1" % where)
         transform = _get(data, "transform", dict, where, default={})
         upstream = _get(data, "upstream", str, where, required=True)
+        quota_policy = _get(data, "quota_policy", str, where)
+        quota_policies = _quota_policy_list(data, "quota_policies", where)
+        # Joint admission is configured exclusively through quota_policies;
+        # naming a non-empty quota_policy at the same time is rejected.
+        if quota_policies is not None and quota_policy:
+            raise GatewayError(
+                "%s: quota_policies and quota_policy cannot both be set" % where)
         return cls(id=route_id, tenant=_get(data, "tenant", str, where, default=ANY_TENANT),
                    method=method, path_prefix=prefix,
                    upstream=upstream,
@@ -126,19 +154,33 @@ class Route:
                    weight=weight,
                    request_headers=_str_map(transform, "request_headers", "%s transform" % where),
                    response_headers=_str_map(transform, "response_headers", "%s transform" % where),
-                   quota_policy=_get(data, "quota_policy", str, where),
+                   quota_policy=quota_policy,
                    timeout_ms=timeout_ms, scopes=_str_list(data, "scopes", where),
-                   fallback_upstreams=_fallback_list(data, "fallback_upstreams", where, upstream))
+                   fallback_upstreams=_fallback_list(data, "fallback_upstreams", where, upstream),
+                   quota_policies=quota_policies)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"id": self.id, "tenant": self.tenant,
-                "match": {"method": self.method, "path_prefix": self.path_prefix},
-                "upstream": self.upstream, "auth_required": self.auth_required,
-                "weight": self.weight, "quota_policy": self.quota_policy,
-                "timeout_ms": self.timeout_ms, "scopes": list(self.scopes),
-                "fallback_upstreams": list(self.fallback_upstreams),
-                "transform": {"request_headers": dict(self.request_headers),
-                              "response_headers": dict(self.response_headers)}}
+        out = {"id": self.id, "tenant": self.tenant,
+               "match": {"method": self.method, "path_prefix": self.path_prefix},
+               "upstream": self.upstream, "auth_required": self.auth_required,
+               "weight": self.weight, "quota_policy": self.quota_policy,
+               "timeout_ms": self.timeout_ms, "scopes": list(self.scopes),
+               "fallback_upstreams": list(self.fallback_upstreams),
+               "transform": {"request_headers": dict(self.request_headers),
+                             "response_headers": dict(self.response_headers)}}
+        # The new field is echoed only for routes that set it, so documents and
+        # sanitized configs written before joint admission keep their old shape.
+        if self.quota_policies is not None:
+            out["quota_policies"] = list(self.quota_policies)
+        return out
+
+    def quota_policy_ids(self) -> List[str]:
+        """The policies governing a request, in declaration order."""
+        if self.quota_policies is not None:
+            return list(self.quota_policies)
+        if self.quota_policy:
+            return [self.quota_policy]
+        return []
 
     def matches(self, method: str, path: str, tenant: Optional[str]) -> bool:
         """``tenant`` of None matches any tenant, so a request can reach the auth step."""
@@ -311,8 +353,9 @@ def parse(raw: Any) -> GatewayConfig:
     _unique(policies, lambda p: p.id, "quota policy")
     known = {p.id for p in policies}
     for route in routes:
-        if route.quota_policy and route.quota_policy not in known:
-            raise GatewayError("route %s: unknown quota_policy %r" % (route.id, route.quota_policy))
+        for policy_id in route.quota_policy_ids():
+            if policy_id not in known:
+                raise GatewayError("route %s: unknown quota policy %r" % (route.id, policy_id))
     return GatewayConfig(routes, keys, policies)
 
 

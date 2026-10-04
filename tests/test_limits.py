@@ -180,6 +180,88 @@ class PartitionedLimiterTest(unittest.TestCase):
         self.assertEqual(len(admitted), 40)
 
 
+class GroupLimiterTest(unittest.TestCase):
+    def policies(self):
+        return [
+            {"id": "pa", "tenant": "*", "algorithm": "token-bucket",
+             "limit": 2, "window_ms": 1000, "burst": 2, "partition_by": "tenant"},
+            {"id": "pb", "tenant": "*", "algorithm": "sliding-window",
+             "limit": 3, "window_ms": 1000, "partition_by": "key"}]
+
+    def test_group_charges_every_bucket_or_none(self):
+        limiter = Limiter(self.policies())
+        targets = [("pa", ("tenant", "t")), ("pb", ("key", "t", "k"))]
+        first = limiter.allow_group(targets, 1, 0)
+        self.assertTrue(first["allowed"])
+        self.assertEqual([r["policy_id"] for r in first["results"]], ["pa", "pb"])
+        second = limiter.allow_group(targets, 1, 0)  # pa now has one unit left
+        self.assertTrue(second["allowed"])
+        # pa exhausted: the group rejects and pb keeps the unit it had room for
+        rejected = limiter.allow_group(targets, 1, 0)
+        self.assertFalse(rejected["allowed"])
+        self.assertEqual(rejected["first_reject"], 0)
+        pa = {r["policy_id"]: r for r in rejected["results"]}["pa"]
+        pb = {r["policy_id"]: r for r in rejected["results"]}["pb"]
+        self.assertFalse(pa["allowed"])
+        self.assertFalse(pb["allowed"])       # group verdict on every record
+        self.assertEqual(pb["remaining"], 1)  # un-deducted availability
+        # pb alone still admits its untouched third unit
+        self.assertTrue(limiter.allow("pb", 1, 0, partition=("key", "t", "k"))["allowed"])
+
+    def test_first_reject_follows_declaration_order(self):
+        limiter = Limiter(self.policies())
+        targets = [("pa", ("tenant", "t")), ("pb", ("key", "t", "k"))]
+        limiter.allow("pb", 1, 0, partition=("key", "t", "k"))
+        limiter.allow("pb", 1, 0, partition=("key", "t", "k"))
+        limiter.allow("pb", 1, 0, partition=("key", "t", "k"))  # pb 3/3, pa full
+        outcome = limiter.allow_group(targets, 1, 0)
+        self.assertFalse(outcome["allowed"])
+        self.assertEqual(outcome["first_reject"], 1)
+        self.assertEqual(outcome["results"][1]["policy_id"], "pb")
+
+    def test_each_algorithm_supports_non_mutating_group_pre_checks(self):
+        for algorithm in ("token-bucket", "leaky-bucket", "sliding-window"):
+            policy = {"id": "p", "tenant": "*", "algorithm": algorithm,
+                      "limit": 1, "window_ms": 1000, "burst": 1, "partition_by": "tenant"}
+            limiter = Limiter([policy])
+            targets = [("p", ("tenant", "a")), ("p", ("tenant", "b"))]
+            outcome = limiter.allow_group(targets, 1, 0)
+            self.assertTrue(outcome["allowed"], algorithm)
+            again = limiter.allow_group(targets, 1, 0)
+            self.assertFalse(again["allowed"], algorithm)
+            # the rejected group changed neither partition
+            self.assertFalse(limiter.allow("p", 1, 0, partition=("tenant", "a"))["allowed"],
+                             algorithm)
+            self.assertFalse(limiter.allow("p", 1, 0, partition=("tenant", "b"))["allowed"],
+                             algorithm)
+
+    def test_concurrent_groups_never_partially_charge_or_exceed(self):
+        policies = [
+            {"id": "pa", "tenant": "*", "algorithm": "token-bucket",
+             "limit": 10, "window_ms": 1000, "burst": 10},
+            {"id": "pb", "tenant": "*", "algorithm": "sliding-window",
+             "limit": 10, "window_ms": 1000}]
+        limiter = Limiter(policies)
+        verdicts = []
+        lock = threading.Lock()
+
+        def worker():
+            outcome = limiter.allow_group([("pa", None), ("pb", None)], 1, 0)
+            with lock:
+                verdicts.append(outcome["allowed"])
+
+        threads = [threading.Thread(target=worker) for _ in range(40)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(verdicts), 10)
+        self.assertEqual(len(verdicts), 40)
+        # each admitted group charged both buckets exactly once
+        self.assertFalse(limiter.allow("pa", 1, 0)["allowed"])
+        self.assertFalse(limiter.allow("pb", 1, 0)["allowed"])
+
+
 class QuotaLedgerTest(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="gwd-ledger-")

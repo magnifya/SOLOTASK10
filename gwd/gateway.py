@@ -149,20 +149,27 @@ class Gateway:
         upstream_name: Optional[str] = None
         key: Optional[ApiKey] = None
         quota: Dict[str, Any] = {"policy_id": None, "allowed": True, "remaining": None}
+        # ``quotas`` stays None on single-policy routes so the audit entry keeps
+        # its historical shape; on joint-admission routes it is an ordered list,
+        # empty until the joint check actually runs.
+        quotas: Optional[List[Dict[str, Any]]] = None
         attempts = 0
 
         def finish(status: int, payload: Optional[Dict[str, Any]] = None,
                    body_text: Optional[str] = None, extra_headers: Optional[Dict[str, str]] = None,
                    replay: bool = False) -> Dict[str, Any]:
             text = body_text if body_text is not None else json.dumps(payload or {}, sort_keys=True)
-            self.audit_log.append({
+            audit_entry: Dict[str, Any] = {
                 "at": now, "request_id": request_id, "tenant": tenant,
                 "key_id": key.key_id if key else None,
                 "route_id": route.id if route else None,
                 "upstream": upstream_name or (route.upstream if route else None),
                 "status": int(status), "attempts": attempts,
                 "latency_ms": max(now - started_ms, int((time.monotonic() - mono) * 1000)),
-                "quota": dict(quota), "idempotent_replay": bool(replay)})
+                "quota": dict(quota), "idempotent_replay": bool(replay)}
+            if quotas is not None:
+                audit_entry["quotas"] = [dict(item) for item in quotas]
+            self.audit_log.append(audit_entry)
             out_headers: Dict[str, str] = {"Content-Type": "application/json"}
             if route:
                 out_headers.update(route.response_headers)
@@ -182,6 +189,11 @@ class Gateway:
             return finish(404, {"error": "no route for %s %s" % (method, path), "request_id": request_id})
         selector = "%s|%s" % (key.key_id if key else "-", request_id)
         route = self._pick_route(candidates, selector)
+        # Joint-admission routes always carry the ordered ``quotas`` audit field,
+        # even when authentication or partition identity fails before the joint
+        # check runs: the list then stays empty and ``quota`` stays unchecked.
+        if route.quota_policies is not None:
+            quotas = []
 
         # 2. authentication and authorisation
         if route.auth_required:
@@ -195,42 +207,63 @@ class Gateway:
                 return finish(403, {"error": "api key is missing required scope(s): %s"
                                              % ",".join(missing), "request_id": request_id})
 
-        # 3. quota
-        if route.quota_policy:
-            policy = self.config.policy(route.quota_policy)
-            partition = None
-            if policy is not None and policy.partition_by != "policy":
-                # Partition identity is resolved here, at the original quota
-                # check point, and never consumes quota or calls the upstream.
-                if key is None:
-                    if policy.partition_by == "key":
-                        # A key partition needs a valid key even on anonymous
-                        # routes: missing secret, unknown secret or a claimed key
-                        # id that does not match the secret are all 401.
-                        return finish(401, {"error": auth_error or "missing api key",
+        # 3. quota. A route names either one policy (``quota_policy``) or an
+        # ordered, non-empty list (``quota_policies``): after authentication,
+        # partition identity is resolved for each policy in declaration order
+        # and the first failure decides the response. Identity errors consume
+        # nothing; the units themselves are admitted atomically, so a request
+        # is charged against every policy or against none of them.
+        policy_ids = route.quota_policy_ids()
+        if policy_ids:
+            joint = route.quota_policies is not None
+            targets: List[Tuple[str, Any]] = []
+            for policy_id in policy_ids:
+                policy = self.config.policy(policy_id)
+                partition = None
+                if policy is not None and policy.partition_by != "policy":
+                    # Partition identity is resolved here, at the original quota
+                    # check point, and never consumes quota or calls the upstream.
+                    if key is None:
+                        if policy.partition_by == "key":
+                            # A key partition needs a valid key even on anonymous
+                            # routes: missing secret, unknown secret or a claimed key
+                            # id that does not match the secret are all 401.
+                            return finish(401, {"error": auth_error or "missing api key",
+                                                "request_id": request_id})
+                        if not tenant:
+                            return finish(400, {"error": "tenant is required by quota policy %s"
+                                                         % policy_id,
+                                                "request_id": request_id})
+                    elif explicit_tenant and explicit_tenant != key.tenant:
+                        return finish(403, {"error": "request tenant %r does not match api key tenant %r"
+                                                     % (explicit_tenant, key.tenant),
                                             "request_id": request_id})
-                    if not tenant:
-                        return finish(400, {"error": "tenant is required by quota policy %s"
-                                                     % route.quota_policy,
-                                            "request_id": request_id})
-                elif explicit_tenant and explicit_tenant != key.tenant:
-                    return finish(403, {"error": "request tenant %r does not match api key tenant %r"
-                                                 % (explicit_tenant, key.tenant),
-                                        "request_id": request_id})
-                if policy.partition_by == "tenant":
-                    partition = ("tenant", tenant)
-                else:
-                    partition = ("key", key.tenant, key.key_id)
-            result = self.limiter.allow(route.quota_policy, 1, now, partition=partition)
-            quota = {"policy_id": route.quota_policy, "allowed": result["allowed"],
-                     "remaining": result["remaining"]}
-            self.ledger.record(tenant, route.quota_policy, key.key_id if key else None, 1,
-                               result["allowed"], now)
-            if not result["allowed"]:
-                retry_after = max(1, int((result["reset_at_ms"] - now + 999) // 1000))
+                    if policy.partition_by == "tenant":
+                        partition = ("tenant", tenant)
+                    else:
+                        partition = ("key", key.tenant, key.key_id)
+                targets.append((policy_id, partition))
+            outcome = self.limiter.allow_group(targets, 1, now)
+            results = outcome["results"]
+            admitted = outcome["allowed"]
+            for result in results:
+                # One usage record per policy in the existing format; cost is one
+                # unit and ``allowed`` is the whole group's verdict.
+                self.ledger.record(tenant, result["policy_id"], key.key_id if key else None,
+                                   1, admitted, now)
+            first = results[0]
+            quota = {"policy_id": first["policy_id"], "allowed": admitted,
+                     "remaining": first["remaining"]}
+            if joint:
+                quotas = [{"policy_id": result["policy_id"], "allowed": admitted,
+                           "remaining": result["remaining"]} for result in results]
+            if not admitted:
+                rejected = results[outcome["first_reject"]]
+                reset_at_ms = outcome["reset_at_ms"]
+                retry_after = max(1, int((reset_at_ms - now + 999) // 1000))
                 return finish(429, {"error": "quota exceeded", "request_id": request_id,
-                                    "policy_id": route.quota_policy,
-                                    "reset_at_ms": result["reset_at_ms"]},
+                                    "policy_id": rejected["policy_id"],
+                                    "reset_at_ms": reset_at_ms},
                               extra_headers={"Retry-After": str(retry_after)})
 
         # 4. idempotency
