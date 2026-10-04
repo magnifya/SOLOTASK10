@@ -1,0 +1,362 @@
+"""Route, API key and quota policy models with validation and mtime hot reload."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional
+
+ALGORITHMS = ("token-bucket", "leaky-bucket", "sliding-window")
+ANY_TENANT = "*"
+ANY_SCOPE = "*"
+EMPTY_CONFIG: Dict[str, Any] = {"routes": [], "keys": [], "quota_policies": []}
+
+
+class GatewayError(Exception):
+    """A rejected configuration or request; ``status`` is the HTTP status to use."""
+
+    def __init__(self, message: str, status: int = 400) -> None:
+        super().__init__(message)
+        self.message = str(message)
+        self.status = int(status)
+
+
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+def _get(data: Dict[str, Any], key: str, kind: type, where: str,
+         default: Any = None, required: bool = False) -> Any:
+    if key not in data or data[key] is None:
+        if required:
+            raise GatewayError("%s: missing field %r" % (where, key))
+        return default
+    value = data[key]
+    bad = (kind is int and isinstance(value, bool)) or not isinstance(value, kind)
+    if bad:
+        raise GatewayError("%s: field %r must be %s" % (where, key, kind.__name__))
+    return value
+
+
+def _str_map(data: Dict[str, Any], key: str, where: str) -> Dict[str, str]:
+    raw = _get(data, key, dict, where, default={})
+    if any(not isinstance(k, str) or not isinstance(v, (str, int, float)) for k, v in raw.items()):
+        raise GatewayError("%s: %r entries must map string to scalar" % (where, key))
+    return {str(k): str(v) for k, v in raw.items()}
+
+
+def _str_list(data: Dict[str, Any], key: str, where: str) -> List[str]:
+    raw = _get(data, key, list, where, default=[])
+    if any(not isinstance(item, str) for item in raw):
+        raise GatewayError("%s: %r entries must be strings" % (where, key))
+    return list(raw)
+
+
+def _unique(items: List[Any], pick: Callable[[Any], str], label: str) -> None:
+    seen = set()
+    for item in items:
+        if pick(item) in seen:
+            raise GatewayError("duplicate %s id: %s" % (label, pick(item)))
+        seen.add(pick(item))
+
+
+@dataclass
+class Route:
+    """One routing rule: match a method plus path prefix onto an upstream."""
+
+    id: str
+    tenant: str
+    method: str
+    path_prefix: str
+    upstream: str
+    auth_required: bool = True
+    weight: int = 1
+    request_headers: Dict[str, str] = field(default_factory=dict)
+    response_headers: Dict[str, str] = field(default_factory=dict)
+    quota_policy: Optional[str] = None
+    timeout_ms: int = 5000
+    scopes: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Any, where: str = "route") -> "Route":
+        if not isinstance(data, dict):
+            raise GatewayError("%s: must be a JSON object" % where)
+        route_id = _get(data, "id", str, where, required=True)
+        where = "route %s" % route_id
+        match = _get(data, "match", dict, where, required=True)
+        method = _get(match, "method", str, "%s match" % where, default="*").upper()
+        prefix = _get(match, "path_prefix", str, "%s match" % where, required=True)
+        if not prefix.startswith("/"):
+            raise GatewayError("%s: path_prefix must start with '/'" % where)
+        weight = _get(data, "weight", int, where, default=1)
+        timeout_ms = _get(data, "timeout_ms", int, where, default=5000)
+        if weight < 1 or timeout_ms < 1:
+            raise GatewayError("%s: weight and timeout_ms must be >= 1" % where)
+        transform = _get(data, "transform", dict, where, default={})
+        return cls(id=route_id, tenant=_get(data, "tenant", str, where, default=ANY_TENANT),
+                   method=method, path_prefix=prefix,
+                   upstream=_get(data, "upstream", str, where, required=True),
+                   auth_required=_get(data, "auth_required", bool, where, default=True),
+                   weight=weight,
+                   request_headers=_str_map(transform, "request_headers", "%s transform" % where),
+                   response_headers=_str_map(transform, "response_headers", "%s transform" % where),
+                   quota_policy=_get(data, "quota_policy", str, where),
+                   timeout_ms=timeout_ms, scopes=_str_list(data, "scopes", where))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"id": self.id, "tenant": self.tenant,
+                "match": {"method": self.method, "path_prefix": self.path_prefix},
+                "upstream": self.upstream, "auth_required": self.auth_required,
+                "weight": self.weight, "quota_policy": self.quota_policy,
+                "timeout_ms": self.timeout_ms, "scopes": list(self.scopes),
+                "transform": {"request_headers": dict(self.request_headers),
+                              "response_headers": dict(self.response_headers)}}
+
+    def matches(self, method: str, path: str, tenant: Optional[str]) -> bool:
+        """``tenant`` of None matches any tenant, so a request can reach the auth step."""
+        if self.method not in ("*", method.upper()):
+            return False
+        if tenant is not None and self.tenant not in (ANY_TENANT, tenant):
+            return False
+        return path.startswith(self.path_prefix)
+
+
+@dataclass
+class ApiKey:
+    """An API key; only the sha256 of the secret is ever stored."""
+
+    key_id: str
+    tenant: str
+    secret_sha256: str
+    scopes: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: Any, where: str = "key") -> "ApiKey":
+        if not isinstance(data, dict):
+            raise GatewayError("%s: must be a JSON object" % where)
+        key_id = _get(data, "key_id", str, where, required=True)
+        where = "key %s" % key_id
+        digest = _get(data, "secret_sha256", str, where, required=True)
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise GatewayError("%s: secret_sha256 must be 64 lowercase hex characters" % where)
+        return cls(key_id, _get(data, "tenant", str, where, default=ANY_TENANT), digest,
+                   _str_list(data, "scopes", where))
+
+    def allows(self, required: List[str]) -> bool:
+        return not required or ANY_SCOPE in self.scopes or set(required).issubset(set(self.scopes))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"key_id": self.key_id, "tenant": self.tenant, "scopes": list(self.scopes),
+                "secret_sha256": self.secret_sha256}
+
+    def public(self) -> Dict[str, Any]:
+        return {"key_id": self.key_id, "tenant": self.tenant, "scopes": list(self.scopes)}
+
+
+@dataclass
+class QuotaPolicy:
+    """A named rate limit policy; one bucket instance is kept per policy id."""
+
+    id: str
+    tenant: str
+    algorithm: str
+    limit: int
+    window_ms: int
+    burst: Optional[int] = None
+
+    @classmethod
+    def from_dict(cls, data: Any, where: str = "quota policy") -> "QuotaPolicy":
+        if not isinstance(data, dict):
+            raise GatewayError("%s: must be a JSON object" % where)
+        policy_id = _get(data, "id", str, where, required=True)
+        where = "quota policy %s" % policy_id
+        algorithm = _get(data, "algorithm", str, where, required=True)
+        if algorithm not in ALGORITHMS:
+            raise GatewayError("%s: algorithm must be one of %s" % (where, ", ".join(ALGORITHMS)))
+        limit = _get(data, "limit", int, where, required=True)
+        window_ms = _get(data, "window_ms", int, where, required=True)
+        burst = _get(data, "burst", int, where)
+        if limit < 1 or window_ms < 1 or (burst is not None and burst < 1):
+            raise GatewayError("%s: limit, window_ms and burst must be >= 1" % where)
+        return cls(policy_id, _get(data, "tenant", str, where, default=ANY_TENANT),
+                   algorithm, limit, window_ms, burst)
+
+    def capacity(self) -> int:
+        return self.burst or self.limit
+
+    def rate_per_ms(self) -> float:
+        return self.limit / float(self.window_ms)
+
+    def signature(self) -> tuple:
+        return (self.algorithm, self.limit, self.window_ms, self.burst)
+
+    def to_dict(self) -> Dict[str, Any]:
+        out = {"id": self.id, "tenant": self.tenant, "algorithm": self.algorithm,
+               "limit": self.limit, "window_ms": self.window_ms}
+        if self.burst is not None:
+            out["burst"] = self.burst
+        return out
+
+
+@dataclass
+class GatewayConfig:
+    routes: List[Route] = field(default_factory=list)
+    keys: List[ApiKey] = field(default_factory=list)
+    policies: List[QuotaPolicy] = field(default_factory=list)
+    revision: int = 0
+
+    def matching_routes(self, method: str, path: str, tenant: Optional[str]) -> List[Route]:
+        return [r for r in self.routes if r.matches(method, path, tenant)]
+
+    def key(self, key_id: str) -> Optional[ApiKey]:
+        return next((k for k in self.keys if k.key_id == key_id), None)
+
+    def sanitized(self) -> Dict[str, Any]:
+        return {"revision": self.revision, "routes": [r.to_dict() for r in self.routes],
+                "keys": [k.public() for k in self.keys],
+                "quota_policies": [p.to_dict() for p in self.policies]}
+
+
+def _list(raw: Dict[str, Any], key: str) -> List[Any]:
+    value = raw.get(key, [])
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise GatewayError("config: %r must be a JSON array" % key)
+    return value
+
+
+def parse(raw: Any) -> GatewayConfig:
+    """Validate a decoded config document and build a :class:`GatewayConfig`."""
+    if not isinstance(raw, dict):
+        raise GatewayError("config root must be a JSON object")
+    routes = [Route.from_dict(item, "route[%d]" % i) for i, item in enumerate(_list(raw, "routes"))]
+    keys = [ApiKey.from_dict(item, "key[%d]" % i) for i, item in enumerate(_list(raw, "keys"))]
+    policies = [QuotaPolicy.from_dict(item, "quota_policy[%d]" % i)
+                for i, item in enumerate(_list(raw, "quota_policies"))]
+    _unique(routes, lambda r: r.id, "route")
+    _unique(keys, lambda k: k.key_id, "api key")
+    _unique(policies, lambda p: p.id, "quota policy")
+    known = {p.id for p in policies}
+    for route in routes:
+        if route.quota_policy and route.quota_policy not in known:
+            raise GatewayError("route %s: unknown quota_policy %r" % (route.id, route.quota_policy))
+    return GatewayConfig(routes, keys, policies)
+
+
+def load(path: str, revision: int = 0) -> GatewayConfig:
+    """Read and validate ``path``; raise :class:`GatewayError` when malformed."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except FileNotFoundError:
+        raise GatewayError("config file not found: %s" % path)
+    except OSError as exc:
+        raise GatewayError("config file unreadable: %s: %s" % (path, exc))
+    except ValueError as exc:
+        raise GatewayError("config file is not valid JSON: %s: %s" % (path, exc))
+    config = parse(raw)
+    config.revision = revision
+    return config
+
+
+def read_raw(path: str) -> Dict[str, Any]:
+    """Return the editable document at ``path`` (an empty template when absent)."""
+    if not os.path.exists(path):
+        return json.loads(json.dumps(EMPTY_CONFIG))
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except ValueError as exc:
+        raise GatewayError("config file is not valid JSON: %s: %s" % (path, exc))
+    if not isinstance(raw, dict):
+        raise GatewayError("config root must be a JSON object")
+    for key in EMPTY_CONFIG:
+        raw.setdefault(key, [])
+    return raw
+
+
+def save_config(path: str, raw: Dict[str, Any]) -> None:
+    """Atomically replace ``path`` with ``raw``."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(raw, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, path)
+
+
+class ConfigStore:
+    """Holds the live config and reloads it when the file mtime changes."""
+
+    def __init__(self, path: Optional[str] = None) -> None:
+        self.path = path
+        self.ready = True
+        self.last_error: Optional[str] = None
+        self._config = GatewayConfig()
+        self._revision = 0
+        self._mtime_ns: Optional[int] = None
+        if path:
+            self.load()
+
+    @property
+    def config(self) -> GatewayConfig:
+        return self._config
+
+    @property
+    def revision(self) -> int:
+        return self._revision
+
+    def adopt(self, config: GatewayConfig, mtime_ns: Optional[int] = None) -> GatewayConfig:
+        self._revision += 1
+        config.revision = self._revision
+        self._config = config
+        self._mtime_ns = self._mtime() if mtime_ns is None else mtime_ns
+        self.ready = True
+        self.last_error = None
+        return config
+
+    def load(self) -> GatewayConfig:
+        if not self.path:
+            raise GatewayError("no config path configured")
+        return self.adopt(load(self.path))
+
+    def _mtime(self) -> Optional[int]:
+        if not self.path:
+            return None
+        try:
+            return os.stat(self.path).st_mtime_ns
+        except OSError:
+            return None
+
+    def reload_if_changed(self) -> bool:
+        """Reload only when the mtime moved; keep the last good config on error."""
+        if not self.path:
+            return False
+        mtime = self._mtime()
+        if mtime is None:
+            self.ready, self.last_error = False, "config file not found: %s" % self.path
+            return False
+        if self._mtime_ns is not None and mtime == self._mtime_ns:
+            return False
+        try:
+            config = load(self.path)
+        except GatewayError as exc:
+            self._mtime_ns, self.ready, self.last_error = mtime, False, exc.message
+            return False
+        self.adopt(config, mtime_ns=mtime)
+        return True
+
+
+_STORES: Dict[str, ConfigStore] = {}
+
+
+def reload_if_changed(path: str) -> bool:
+    """Process wide convenience wrapper around :meth:`ConfigStore.reload_if_changed`."""
+    key = os.path.abspath(path)
+    store = _STORES.get(key)
+    if store is None:
+        store = _STORES[key] = ConfigStore(path)
+    return store.reload_if_changed()
