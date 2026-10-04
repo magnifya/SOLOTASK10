@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
 ALGORITHMS = ("token-bucket", "leaky-bucket", "sliding-window")
+PARTITION_MODES = ("policy", "tenant", "key")
 ANY_TENANT = "*"
 ANY_SCOPE = "*"
 EMPTY_CONFIG: Dict[str, Any] = {"routes": [], "keys": [], "quota_policies": []}
@@ -157,7 +158,7 @@ class ApiKey:
 
 @dataclass
 class QuotaPolicy:
-    """A named rate limit policy; one bucket instance is kept per policy id."""
+    """A named rate limit policy; one bucket instance is kept per partition."""
 
     id: str
     tenant: str
@@ -165,6 +166,7 @@ class QuotaPolicy:
     limit: int
     window_ms: int
     burst: Optional[int] = None
+    partition_by: str = "policy"
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "quota policy") -> "QuotaPolicy":
@@ -180,8 +182,21 @@ class QuotaPolicy:
         burst = _get(data, "burst", int, where)
         if limit < 1 or window_ms < 1 or (burst is not None and burst < 1):
             raise GatewayError("%s: limit, window_ms and burst must be >= 1" % where)
+        # partition_by is rejected explicitly when present (even null), while an
+        # omitted field keeps the historical policy-wide sharing mode.
+        if "partition_by" not in data:
+            partition_by = "policy"
+        else:
+            raw_partition = data["partition_by"]
+            if not isinstance(raw_partition, str) or not raw_partition:
+                raise GatewayError(
+                    "%s: partition_by must be one of %s" % (where, ", ".join(PARTITION_MODES)))
+            partition_by = raw_partition
+            if partition_by not in PARTITION_MODES:
+                raise GatewayError(
+                    "%s: partition_by must be one of %s" % (where, ", ".join(PARTITION_MODES)))
         return cls(policy_id, _get(data, "tenant", str, where, default=ANY_TENANT),
-                   algorithm, limit, window_ms, burst)
+                   algorithm, limit, window_ms, burst, partition_by)
 
     def capacity(self) -> int:
         return self.burst or self.limit
@@ -190,11 +205,16 @@ class QuotaPolicy:
         return self.limit / float(self.window_ms)
 
     def signature(self) -> tuple:
-        return (self.algorithm, self.limit, self.window_ms, self.burst)
+        # Buckets are preserved only while the tenant scope, partition mode and
+        # every algorithm parameter stay identical; any change restarts the
+        # policy's partitions from their initial state.
+        return (self.tenant, self.partition_by, self.algorithm,
+                self.limit, self.window_ms, self.burst)
 
     def to_dict(self) -> Dict[str, Any]:
         out = {"id": self.id, "tenant": self.tenant, "algorithm": self.algorithm,
-               "limit": self.limit, "window_ms": self.window_ms}
+               "limit": self.limit, "window_ms": self.window_ms,
+               "partition_by": self.partition_by}
         if self.burst is not None:
             out["burst"] = self.burst
         return out
@@ -212,6 +232,9 @@ class GatewayConfig:
 
     def key(self, key_id: str) -> Optional[ApiKey]:
         return next((k for k in self.keys if k.key_id == key_id), None)
+
+    def policy(self, policy_id: str) -> Optional[QuotaPolicy]:
+        return next((p for p in self.policies if p.id == policy_id), None)
 
     def sanitized(self) -> Dict[str, Any]:
         return {"revision": self.revision, "routes": [r.to_dict() for r in self.routes],

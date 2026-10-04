@@ -110,9 +110,32 @@ class HttpTest(unittest.TestCase):
         status, _, payload = self.json_request("POST", "/v1/quota/policies", policy)
         self.assertEqual(status, 201)
         self.assertEqual(payload["algorithm"], "leaky-bucket")
+        self.assertEqual(payload["partition_by"], "policy")  # omitted defaults to policy
         status, _, payload = self.json_request("GET", "/v1/quota/usage?tenant=acme")
         self.assertEqual(status, 200)
         self.assertEqual(payload["tenant"], "acme")
+
+    def test_partition_policy_create_echo_config_and_400(self):
+        policy = {"id": "p-tenant", "tenant": "*", "algorithm": "sliding-window",
+                  "limit": 3, "window_ms": 1000, "partition_by": "tenant"}
+        status, _, payload = self.json_request("POST", "/v1/quota/policies", policy)
+        self.assertEqual(status, 201)
+        self.assertEqual(payload["partition_by"], "tenant")
+        status, _, config = self.json_request("GET", "/v1/config")
+        created = {p["id"]: p for p in config["quota_policies"]}
+        self.assertEqual(created["p-tenant"]["partition_by"], "tenant")
+        for bad in (None, "", "route", 7):
+            status, _, reply = self.json_request(
+                "POST", "/v1/quota/policies",
+                {"id": "p-bad-%s" % str(bad), "algorithm": "token-bucket",
+                 "limit": 1, "window_ms": 1, "partition_by": bad})
+            self.assertEqual(status, 400, bad)
+            self.assertIn("request_id", reply)
+        # the failed creates must not have changed the configuration
+        status, _, config = self.json_request("GET", "/v1/config")
+        ids = {p["id"] for p in config["quota_policies"]}
+        self.assertNotIn("p-bad-None", ids)
+        self.assertIn("p-tenant", ids)
 
     def test_proxy_success_error_and_quota(self):
         authorization = {"authorization": "Bearer " + SECRET}

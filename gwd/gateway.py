@@ -163,6 +163,7 @@ class Gateway:
                     "request_id": request_id, "route_id": route.id if route else None}
 
         key, auth_error = self._resolve_key(hdrs)
+        explicit_tenant = tenant or ""
         tenant = tenant or (key.tenant if key else "")
         candidates = self.config.matching_routes(method, path, tenant)
         if not candidates:
@@ -188,7 +189,31 @@ class Gateway:
 
         # 3. quota
         if route.quota_policy:
-            result = self.limiter.allow(route.quota_policy, 1, now)
+            policy = self.config.policy(route.quota_policy)
+            partition = None
+            if policy is not None and policy.partition_by != "policy":
+                # Partition identity is resolved here, at the original quota
+                # check point, and never consumes quota or calls the upstream.
+                if key is None:
+                    if policy.partition_by == "key":
+                        # A key partition needs a valid key even on anonymous
+                        # routes: missing secret, unknown secret or a claimed key
+                        # id that does not match the secret are all 401.
+                        return finish(401, {"error": auth_error or "missing api key",
+                                            "request_id": request_id})
+                    if not tenant:
+                        return finish(400, {"error": "tenant is required by quota policy %s"
+                                                     % route.quota_policy,
+                                            "request_id": request_id})
+                elif explicit_tenant and explicit_tenant != key.tenant:
+                    return finish(403, {"error": "request tenant %r does not match api key tenant %r"
+                                                 % (explicit_tenant, key.tenant),
+                                        "request_id": request_id})
+                if policy.partition_by == "tenant":
+                    partition = ("tenant", tenant)
+                else:
+                    partition = ("key", key.tenant, key.key_id)
+            result = self.limiter.allow(route.quota_policy, 1, now, partition=partition)
             quota = {"policy_id": route.quota_policy, "allowed": result["allowed"],
                      "remaining": result["remaining"]}
             self.ledger.record(tenant, route.quota_policy, key.key_id if key else None, 1,

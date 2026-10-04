@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 
 from gwd.config import GatewayError
@@ -102,6 +103,81 @@ class LimiterTest(unittest.TestCase):
         limiter.sync([])
         with self.assertRaises(GatewayError):
             limiter.allow("p", 1, 0)
+
+
+class PartitionedLimiterTest(unittest.TestCase):
+    def policy(self, **overrides):
+        policy = {"id": "p", "tenant": "*", "algorithm": "token-bucket",
+                  "limit": 2, "window_ms": 1000, "burst": 2, "partition_by": "tenant"}
+        policy.update(overrides)
+        return policy
+
+    def test_partitions_are_independent_and_default_is_policy_wide(self):
+        limiter = Limiter([self.policy()])
+        # tenant A exhausts its own partition ...
+        self.assertTrue(limiter.allow("p", 1, 0, partition=("tenant", "a"))["allowed"])
+        self.assertTrue(limiter.allow("p", 1, 0, partition=("tenant", "a"))["allowed"])
+        self.assertFalse(limiter.allow("p", 1, 0, partition=("tenant", "a"))["allowed"])
+        # ... while tenant B and key partitions stay full.
+        self.assertTrue(limiter.allow("p", 1, 0, partition=("tenant", "b"))["allowed"])
+        self.assertTrue(limiter.allow("p", 1, 0, partition=("key", "a", "k1"))["allowed"])
+        # omitting the partition keeps the historical single policy bucket
+        self.assertTrue(limiter.allow("p", 1, 0)["allowed"])
+        self.assertTrue(limiter.allow("p", 1, 0)["allowed"])
+        self.assertFalse(limiter.allow("p", 1, 0)["allowed"])
+
+    def test_all_three_algorithms_partition_independently(self):
+        for algorithm in ("token-bucket", "leaky-bucket", "sliding-window"):
+            limiter = Limiter([self.policy(algorithm=algorithm)])
+            a1 = limiter.allow("p", 1, 0, partition=("tenant", "a"))
+            a2 = limiter.allow("p", 1, 0, partition=("tenant", "a"))
+            self.assertTrue(a1["allowed"] and a2["allowed"], algorithm)
+            self.assertFalse(limiter.allow("p", 1, 0, partition=("tenant", "a"))["allowed"],
+                             algorithm)
+            self.assertTrue(limiter.allow("p", 1, 0, partition=("tenant", "b"))["allowed"],
+                            algorithm)
+
+    def test_sync_preserves_partitions_then_resets_them_on_any_change(self):
+        policy = self.policy()
+        limiter = Limiter([policy])
+        self.assertTrue(limiter.allow("p", 1, 0, partition=("tenant", "a"))["allowed"])
+        self.assertTrue(limiter.allow("p", 1, 0, partition=("tenant", "a"))["allowed"])
+        # identical identity and parameters: partition state survives
+        limiter.sync([dict(policy)])
+        self.assertFalse(limiter.allow("p", 1, 0, partition=("tenant", "a"))["allowed"])
+        # an algorithm parameter change restarts every partition from scratch
+        limiter.sync([self.policy(limit=3, burst=3)])
+        self.assertTrue(limiter.allow("p", 1, 0, partition=("tenant", "a"))["allowed"])
+        # changing the partition mode also restarts partitions
+        limiter.sync([self.policy(limit=3, burst=3, partition_by="key")])
+        self.assertTrue(
+            limiter.allow("p", 1, 0, partition=("key", "a", "k1"))["allowed"])
+        # removing the policy drops its partitions ...
+        limiter.sync([])
+        with self.assertRaises(GatewayError):
+            limiter.allow("p", 1, 0, partition=("key", "a", "k1"))
+        # ... and re-adding it starts again from the initial state
+        limiter.sync([self.policy(limit=3, burst=3, partition_by="key")])
+        self.assertTrue(
+            limiter.allow("p", 1, 0, partition=("key", "a", "k1"))["allowed"])
+
+    def test_concurrent_requests_in_one_partition_cannot_exceed_the_limit(self):
+        limiter = Limiter([self.policy(limit=10, burst=10)])
+        admitted = []
+        lock = threading.Lock()
+
+        def worker():
+            result = limiter.allow("p", 1, 0, partition=("tenant", "a"))
+            with lock:
+                admitted.append(result["allowed"])
+
+        threads = [threading.Thread(target=worker) for _ in range(40)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(admitted), 10)
+        self.assertEqual(len(admitted), 40)
 
 
 class QuotaLedgerTest(unittest.TestCase):

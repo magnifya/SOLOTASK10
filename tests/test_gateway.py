@@ -155,6 +155,155 @@ class QuotaTest(GatewayTestCase):
         self.assertEqual(self.gateway.usage("acme")["requests"], 0)
 
 
+SECRET_OTHER = "other-secret"
+
+
+def partition_document():
+    return {
+        "quota_policies": [
+            {"id": "p-tenant", "tenant": "*", "algorithm": "token-bucket",
+             "limit": 2, "window_ms": 60000, "burst": 2, "partition_by": "tenant"},
+            {"id": "p-key", "tenant": "*", "algorithm": "token-bucket",
+             "limit": 2, "window_ms": 60000, "burst": 2, "partition_by": "key"}],
+        "keys": [
+            {"key_id": "k-read", "tenant": "acme", "secret_sha256": sha(SECRET_READ),
+             "scopes": ["read"]},
+            {"key_id": "k-other", "tenant": "acme", "secret_sha256": sha(SECRET_OTHER),
+             "scopes": ["read"]},
+            {"key_id": "k-globex", "tenant": "globex", "secret_sha256": sha(SECRET_GLOBEX),
+             "scopes": ["read"]}],
+        "routes": [
+            {"id": "r-t", "tenant": "*", "match": {"method": "GET", "path_prefix": "/t"},
+             "upstream": "echo", "quota_policy": "p-tenant", "scopes": ["read"]},
+            {"id": "r-topen", "tenant": "*", "match": {"method": "GET", "path_prefix": "/to"},
+             "upstream": "echo", "quota_policy": "p-tenant", "auth_required": False},
+            {"id": "r-k", "tenant": "*", "match": {"method": "GET", "path_prefix": "/k"},
+             "upstream": "echo", "quota_policy": "p-key", "auth_required": False},
+            {"id": "r-kauth", "tenant": "*", "match": {"method": "GET", "path_prefix": "/ka"},
+             "upstream": "echo", "quota_policy": "p-key", "scopes": ["read"]}],
+    }
+
+
+class PartitionQuotaTest(unittest.TestCase):
+    def setUp(self):
+        self.gateway, self.root, self.path = make_gateway(
+            partition_document(),
+            breaker_settings={"failure_threshold": 1, "open_ms": 1000, "success_threshold": 1})
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.calls = []
+
+        def counting(request):
+            self.calls.append(request)
+            return {"status": 200, "body": {"n": len(self.calls)}}
+
+        self.gateway.upstreams.register("echo", counting)
+
+    def key(self, secret=SECRET_READ):
+        return {"authorization": "Bearer " + secret}
+
+    def body_of(self, response):
+        return json.loads(response["body"])
+
+    def test_tenant_mode_is_shared_across_keys_and_routes_but_isolated_per_tenant(self):
+        statuses = [
+            self.gateway.handle("acme", "GET", "/t", self.key(), "", now_ms=0)["status"],
+            self.gateway.handle("acme", "GET", "/t", self.key(SECRET_OTHER), "", now_ms=0)["status"],
+            self.gateway.handle("acme", "GET", "/t", self.key(), "", now_ms=0)["status"],
+            self.gateway.handle("globex", "GET", "/t", self.key(SECRET_GLOBEX), "", now_ms=0)["status"],
+        ]
+        self.assertEqual(statuses, [200, 200, 429, 200])
+
+    def test_tenant_mode_anonymous_uses_the_request_tenant_and_shares_the_partition(self):
+        # anonymous requests are attributed to the explicit request tenant and
+        # share that tenant's bucket with authenticated requests on other routes
+        self.assertEqual(self.gateway.handle("acme", "GET", "/t", self.key(), "", now_ms=0)["status"],
+                         200)
+        self.assertEqual(self.gateway.handle("acme", "GET", "/to", {}, "", now_ms=0)["status"], 200)
+        self.assertEqual(self.gateway.handle("acme", "GET", "/to", {}, "", now_ms=0)["status"], 429)
+        self.assertEqual(self.gateway.handle("globex", "GET", "/to", {}, "", now_ms=0)["status"], 200)
+
+    def test_tenant_mode_empty_tenant_is_400_without_ledger_or_upstream(self):
+        response = self.gateway.handle("", "GET", "/to", {}, "", now_ms=0)
+        self.assertEqual(response["status"], 400)
+        payload = self.body_of(response)
+        self.assertIn("tenant", payload["error"])
+        self.assertIn("request_id", payload)
+        self.assertEqual(self.gateway.usage("")["requests"], 0)
+        self.assertEqual(len(self.calls), 0)
+        entry = self.gateway.audit("", 10)[-1]
+        self.assertEqual(entry["status"], 400)
+        self.assertIsNone(entry["quota"]["policy_id"])
+
+    def test_key_mode_is_isolated_per_key_and_shared_across_routes(self):
+        statuses = [
+            self.gateway.handle("acme", "GET", "/k", self.key(), "", now_ms=0)["status"],
+            self.gateway.handle("acme", "GET", "/ka", self.key(), "", now_ms=0)["status"],
+            self.gateway.handle("acme", "GET", "/k", self.key(), "", now_ms=0)["status"],
+            self.gateway.handle("acme", "GET", "/k", self.key(SECRET_OTHER), "", now_ms=0)["status"],
+        ]
+        self.assertEqual(statuses, [200, 200, 429, 200])
+
+    def test_key_mode_requires_a_valid_key_even_when_the_route_allows_anonymous(self):
+        missing = self.gateway.handle("", "GET", "/k", {}, "", now_ms=0)
+        unknown = self.gateway.handle("", "GET", "/k",
+                                     {"authorization": "Bearer wrong"}, "", now_ms=0)
+        mismatch_headers = dict(self.key(), **{"x-api-key": "k-other"})
+        mismatch = self.gateway.handle("acme", "GET", "/k", mismatch_headers, "", now_ms=0)
+        self.assertEqual([missing["status"], unknown["status"], mismatch["status"]],
+                         [401, 401, 401])
+        self.assertEqual(self.gateway.usage("")["requests"], 0)
+        self.assertEqual(len(self.calls), 0)
+        for response in (missing, unknown, mismatch):
+            self.assertIn("request_id", self.body_of(response))
+        entries = self.gateway.audit("", 10)
+        self.assertEqual([e["status"] for e in entries[-3:]], [401, 401, 401])
+
+    def test_valid_key_with_a_mismatched_request_tenant_is_403_in_both_modes(self):
+        tenant_mode = self.gateway.handle("globex", "GET", "/t", self.key(), "", now_ms=0)
+        key_mode = self.gateway.handle("globex", "GET", "/k", self.key(), "", now_ms=0)
+        self.assertEqual(tenant_mode["status"], 403)
+        self.assertEqual(key_mode["status"], 403)
+        self.assertEqual(self.gateway.usage("globex")["requests"], 0)
+        self.assertEqual(len(self.calls), 0)
+
+    def test_rejected_quota_still_records_usage_and_a_retry_after_header(self):
+        for _ in range(2):
+            self.gateway.handle("acme", "GET", "/k", self.key(), "", now_ms=0)
+        response = self.gateway.handle("acme", "GET", "/k", self.key(), "", now_ms=0)
+        self.assertEqual(response["status"], 429)
+        self.assertEqual(response["headers"]["Retry-After"], "30")
+        usage = self.gateway.usage("acme")
+        self.assertEqual((usage["requests"], usage["allowed"], usage["rejected"]), (3, 2, 1))
+
+    def test_audit_quota_block_keeps_the_existing_shape(self):
+        self.gateway.handle("acme", "GET", "/t", self.key(), "", now_ms=1234)
+        entry = self.gateway.audit("acme", 1)[0]
+        self.assertEqual(entry["quota"],
+                         {"policy_id": "p-tenant", "allowed": True, "remaining": 1})
+
+    def test_hot_reload_preserves_then_resets_partition_buckets(self):
+        for _ in range(2):
+            self.gateway.handle("acme", "GET", "/t", self.key(), "", now_ms=0)
+        self.assertEqual(self.gateway.handle("acme", "GET", "/t", self.key(), "", now_ms=0)["status"],
+                         429)
+        write_config(self.path, partition_document())
+        self.assertTrue(self.gateway.reload_config())
+        # identity and algorithm parameters unchanged: the partition stays exhausted
+        self.assertEqual(self.gateway.handle("acme", "GET", "/t", self.key(), "", now_ms=0)["status"],
+                         429)
+        changed = partition_document()
+        changed["quota_policies"][0]["burst"] = 5
+        write_config(self.path, changed)
+        self.gateway.reload_config()
+        self.assertEqual(self.gateway.handle("acme", "GET", "/t", self.key(), "", now_ms=0)["status"],
+                         200)
+
+    def test_sanitized_config_reports_the_partition_mode(self):
+        policies = {p["id"]: p for p in self.gateway.sanitized_config()["quota_policies"]}
+        self.assertEqual(policies["p-tenant"]["partition_by"], "tenant")
+        self.assertEqual(policies["p-key"]["partition_by"], "key")
+
+
 class IdempotencyTest(GatewayTestCase):
     def test_same_key_and_body_replays_without_calling_upstream(self):
         headers = {"x-idempotency-key": "idem-1"}
@@ -369,11 +518,37 @@ class ConfigTest(unittest.TestCase):
             "bad weight": {"routes": [{"id": "r", "match": {"method": "GET", "path_prefix": "/a"},
                                        "upstream": "echo", "weight": 0}]},
             "bad secret": {"keys": [{"key_id": "k", "tenant": "t", "secret_sha256": "xyz"}]},
+            "partition null": {"quota_policies": [{"id": "p", "algorithm": "token-bucket",
+                                                   "limit": 1, "window_ms": 1,
+                                                   "partition_by": None}]},
+            "partition empty": {"quota_policies": [{"id": "p", "algorithm": "token-bucket",
+                                                    "limit": 1, "window_ms": 1,
+                                                    "partition_by": ""}]},
+            "partition unknown": {"quota_policies": [{"id": "p", "algorithm": "token-bucket",
+                                                      "limit": 1, "window_ms": 1,
+                                                      "partition_by": "route"}]},
+            "partition number": {"quota_policies": [{"id": "p", "algorithm": "token-bucket",
+                                                     "limit": 1, "window_ms": 1,
+                                                     "partition_by": 1}]},
+            "partition list": {"quota_policies": [{"id": "p", "algorithm": "token-bucket",
+                                                   "limit": 1, "window_ms": 1,
+                                                   "partition_by": ["tenant"]}]},
         }
         for label, doc in cases.items():
             write_config(self.path, doc)
             with self.assertRaises(GatewayError, msg=label):
                 load(self.path)
+
+    def test_partition_by_defaults_to_policy_and_round_trips(self):
+        for mode in (None, "policy", "tenant", "key"):
+            policy = {"id": "p", "algorithm": "token-bucket", "limit": 1, "window_ms": 1}
+            if mode is not None:
+                policy["partition_by"] = mode
+            doc = {"routes": [], "keys": [], "quota_policies": [policy]}
+            write_config(self.path, doc)
+            loaded = load(self.path)
+            self.assertEqual(loaded.policies[0].partition_by, mode or "policy")
+            self.assertEqual(loaded.policies[0].to_dict()["partition_by"], mode or "policy")
 
     def test_missing_file_is_rejected(self):
         with self.assertRaises(GatewayError):

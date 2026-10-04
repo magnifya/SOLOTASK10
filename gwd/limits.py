@@ -9,10 +9,14 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 from collections import deque
 from typing import Any, Deque, Dict, Iterable, List, Optional
 
 from .config import GatewayError, QuotaPolicy
+
+#: The single partition used by the historical policy-wide sharing mode.
+POLICY_PARTITION = "-"
 
 
 def _append_jsonl(path: str, entry: Dict[str, Any]) -> None:
@@ -141,11 +145,21 @@ def make_bucket(policy: QuotaPolicy):
 
 
 class Limiter:
-    """Registry of policy id -> bucket; unchanged buckets keep their state."""
+    """Registry of policy id -> partition key -> bucket.
+
+    Buckets are created lazily per partition and keep their state across syncs
+    while the policy signature (tenant scope, partition mode and algorithm
+    parameters) is unchanged; a changed signature rebuilds every partition of
+    that policy from its initial state, and a removed policy drops them all.
+    ``allow`` checks and consumes under one lock, so concurrent requests in the
+    same partition can never admit more than the limit.
+    """
 
     def __init__(self, policies: Optional[Iterable[Any]] = None) -> None:
         self._policies: Dict[str, QuotaPolicy] = {}
-        self._buckets: Dict[str, tuple] = {}
+        # policy_id -> {partition: (signature, bucket)}
+        self._buckets: Dict[str, Dict[str, tuple]] = {}
+        self._lock = threading.RLock()
         if policies:
             self.sync(policies)
 
@@ -154,26 +168,45 @@ class Limiter:
         for item in policies:
             policy = item if isinstance(item, QuotaPolicy) else QuotaPolicy.from_dict(item)
             wanted[policy.id] = policy
-        self._buckets = {k: v for k, v in self._buckets.items() if k in wanted}
-        self._policies = wanted
+        with self._lock:
+            kept: Dict[str, Dict[str, tuple]] = {}
+            for policy_id, partitions in self._buckets.items():
+                policy = wanted.get(policy_id)
+                if policy is None:
+                    continue  # policy removed: its partitions start fresh if readded
+                signature = policy.signature()
+                # Same identity and parameters: preserve each partition's state.
+                kept[policy_id] = {part: entry for part, entry in partitions.items()
+                                   if entry[0] == signature}
+            self._buckets = kept
+            self._policies = wanted
 
     def set_policy(self, policy: Any) -> QuotaPolicy:
         parsed = policy if isinstance(policy, QuotaPolicy) else QuotaPolicy.from_dict(policy)
-        self._policies[parsed.id] = parsed
+        with self._lock:
+            self._policies[parsed.id] = parsed
         return parsed
 
-    def bucket(self, policy_id: str):
-        policy = self._policies.get(policy_id)
-        if policy is None:
-            raise GatewayError("unknown quota policy: %s" % policy_id, 404)
-        current = self._buckets.get(policy_id)
-        if current is None or current[0] != policy.signature():
-            current = (policy.signature(), make_bucket(policy))
-            self._buckets[policy_id] = current
-        return current[1]
+    def bucket(self, policy_id: str, partition: Any = POLICY_PARTITION):
+        with self._lock:
+            policy = self._policies.get(policy_id)
+            if policy is None:
+                raise GatewayError("unknown quota policy: %s" % policy_id, 404)
+            partitions = self._buckets.setdefault(policy_id, {})
+            signature = policy.signature()
+            current = partitions.get(partition)
+            if current is None or current[0] != signature:
+                current = (signature, make_bucket(policy))
+                partitions[partition] = current
+            return current[1]
 
-    def allow(self, policy_id: str, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
-        result = self.bucket(policy_id).allow(cost, now_ms)
+    def allow(self, policy_id: str, cost: int = 1, now_ms: int = 0,
+              partition: Any = None) -> Dict[str, Any]:
+        # ``None`` means the historical single policy-wide partition; tenant and
+        # key modes pass an immutable tuple identifying the partition.
+        part = POLICY_PARTITION if partition is None else partition
+        with self._lock:
+            result = self.bucket(policy_id, part).allow(cost, now_ms)
         result["policy_id"] = policy_id
         return result
 

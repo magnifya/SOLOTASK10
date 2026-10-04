@@ -13,7 +13,7 @@ configure.
 ## Running it
 
 ```bash
-# 1. run the test suite (66 tests, no network, no sleeping)
+# 1. run the test suite (82 tests, no network, no sleeping)
 python3 -m unittest discover -s tests -v
 
 # 2. start the gateway
@@ -62,9 +62,12 @@ tests; only the HTTP front end reads the wall clock.
    or a missing route scope -> `403`. Routes with `"auth_required": false` skip
    this step. Only `sha256(secret)` is ever stored, and it is compared in constant
    time.
-4. **Quota.** If the route names a `quota_policy`, one unit is charged. A rejected
-   request gets `429` with `policy_id` and `reset_at_ms` plus a `Retry-After`
-   header, and the *rejected attempt is still written to the ledger*.
+4. **Quota.** If the route names a `quota_policy`, one unit is charged against
+   the partition resolved for that policy (see below). A rejected request gets
+   `429` with `policy_id` and `reset_at_ms` plus a `Retry-After` header, and the
+   *rejected attempt is still written to the ledger*. Identity rejections raised
+   while resolving a partition (`400`/`401`/`403`) consume no quota, write no
+   usage and never call the upstream, but are still audited.
 5. **Idempotency.** See below; a replay short circuits the rest of the pipeline.
 6. **Circuit breaker + retries.** One breaker per upstream name; an open breaker
    returns `503 {"error":"upstream unavailable","state":"open"}` without calling
@@ -132,6 +135,52 @@ call per entry, so a crash can only leave a torn trailing line, which readers
 skip. `usage(tenant, since_ms)` aggregates requests, allowed, rejected and cost,
 overall and per policy.
 
+## Quota partitions
+
+A quota policy accepts `partition_by`, which must be one of `"policy"`,
+`"tenant"` or `"key"`. Omitting the field (or loading a document written before
+the field existed) keeps the historical `"policy"` mode: every route using the
+policy shares one bucket. `null`, the empty string, any other value or a
+non-string value fail validation with a `GatewayError` (`400` on
+`POST /v1/quota/policies`; the CLI exits with its usual single-line JSON error),
+and a rejected creation changes neither the configuration nor any quota state.
+
+| `partition_by` | One bucket per | Identity used |
+| --- | --- | --- |
+| `policy` (default) | the policy id | none |
+| `tenant` | policy id + tenant | the effective key's tenant; for an anonymous request the request tenant resolved by the existing rules (`?tenant=` / `X-Tenant`) |
+| `key` | policy id + the key's tenant and `key_id` | the presented API key; the same key shares its quota across every route |
+
+All three algorithms support partitions; each partition computes its remaining
+quota and recovery time independently with the same time and burst rules. The
+partition key is resolved at the original quota check point:
+
+* **tenant mode:** an empty request tenant (no key and no request tenant) is
+  `400`.
+* **key mode:** a missing/unknown secret or a claimed `X-Api-Key` that does not
+  match the presented secret is `401`, even when the matched route allows
+  anonymous access (`auth_required: false`).
+* **both modes:** when a valid key is presented together with an explicit
+  request tenant that differs from the key's tenant, the request is `403`.
+
+These responses keep the usual JSON body (`error`, `request_id`), write one
+audit entry, but do not consume quota, do not write a usage record and do not
+call the upstream. `Gateway.handle` and the HTTP proxy run identical partition
+rules.
+
+Each quota check is still a one-unit allow-then-consume guarded by a single
+lock, so concurrent requests in the same partition can never exceed the limit.
+An idempotent replay checks quota before replaying, and upstream retries are not
+billed twice. `429` and `Retry-After` keep their meaning, and the usage and
+audit summaries keep their existing shape.
+
+A valid hot reload preserves a policy's partition buckets while its `id`,
+`tenant`, `partition_by` and algorithm parameters (`algorithm`, `limit`,
+`window_ms`, `burst`) are all unchanged. Changing any of them restarts only that
+policy's partitions from their initial state; removing the policy and adding it
+back also starts fresh. An invalid reload keeps the previous configuration,
+health state, error feedback and every bucket.
+
 ## Configuration
 
 ```json
@@ -148,18 +197,22 @@ overall and per policy.
   "keys": [{"key_id": "k-1", "tenant": "acme",
             "secret_sha256": "<64 lowercase hex>", "scopes": ["read"]}],
   "quota_policies": [{"id": "p-api", "tenant": "acme", "algorithm": "token-bucket",
-                      "limit": 10, "window_ms": 1000, "burst": 20}]
+                      "limit": 10, "window_ms": 1000, "burst": 20,
+                      "partition_by": "tenant"}]
 }
 ```
 
 `scopes` defaults to `[]` (no scope required); a key holding the `*` scope
 satisfies any requirement. `tenant: "*"` marks a route shared by every tenant.
-`load()` rejects malformed documents with `GatewayError` (unknown algorithm,
-non-positive `limit`/`window_ms`/`burst`/`weight`, `path_prefix` without a leading
-`/`, malformed `secret_sha256`, duplicate ids, a route naming an unknown quota
-policy). `reload_if_changed()` re-reads the file only when its mtime moved and
-keeps `ready` true only when the new document is valid; an invalid reload keeps
-the last known good config, sets `ready = false` and records `last_error`.
+`partition_by` defaults to `"policy"` and accepts only `"policy"`, `"tenant"`
+and `"key"` (see [Quota partitions](#quota-partitions)). `load()` rejects
+malformed documents with `GatewayError` (unknown algorithm, an invalid
+`partition_by`, non-positive `limit`/`window_ms`/`burst`/`weight`,
+`path_prefix` without a leading `/`, malformed `secret_sha256`, duplicate ids, a
+route naming an unknown quota policy). `reload_if_changed()` re-reads the file
+only when its mtime moved and keeps `ready` true only when the new document is
+valid; an invalid reload keeps the last known good config, sets `ready = false`
+and records `last_error`.
 
 ## HTTP API
 
@@ -172,11 +225,11 @@ are unauthenticated in this skeleton - front them with your own auth in producti
 | GET | `/v1/config` | `200` sanitized config (never any secret or hash) | - |
 | POST | `/v1/config/reload` | `200 {"reloaded","revision","ready","error"}` | - |
 | POST | `/v1/keys` | `201 {"key_id","tenant","scopes","secret_sha256","secret"}` (secret returned once) | `400` bad JSON / missing tenant, `409` duplicate key id |
-| POST | `/v1/quota/policies` | `201` policy object | `400` invalid policy, `409` duplicate id |
+| POST | `/v1/quota/policies` | `201` policy object (echoes `partition_by`) | `400` invalid policy / `partition_by`, `409` duplicate id |
 | GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | `400` non-integer `since` |
 | GET | `/v1/audit?tenant=&limit=` | `200 {"tenant","count","entries"}` | `400` non-integer `limit` |
 | POST | `/v1/breaker/reset` | `200 {"reset":["upstream",...]}` | `400` bad JSON |
-| * | any other path | proxied through the pipeline | `401` missing/unknown key, `403` scope or tenant, `404` no route, `409` idempotency conflict, `429` quota exceeded, `502` upstream error, `503` breaker open |
+| * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition), `401` missing/unknown key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict, `429` quota exceeded, `502` upstream error, `503` breaker open |
 
 A `/gw/{path}` prefix on the proxy surface is stripped before matching upstreams,
 so `/gw/api/items` is matched as `/api/items`.
