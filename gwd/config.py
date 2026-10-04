@@ -55,6 +55,27 @@ def _str_list(data: Dict[str, Any], key: str, where: str) -> List[str]:
     return list(raw)
 
 
+def _fallback_list(data: Dict[str, Any], upstream: str, where: str) -> List[str]:
+    """Ordered backup upstreams; omitted means no failover, anything else is strict."""
+    if "fallback_upstreams" not in data:
+        return []
+    raw = data["fallback_upstreams"]
+    if raw is None or not isinstance(raw, list):
+        raise GatewayError("%s: fallback_upstreams must be an array of upstream names" % where)
+    out: List[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item:
+            raise GatewayError("%s: fallback_upstreams entries must be non-empty upstream names"
+                               % where)
+        if item == upstream:
+            raise GatewayError("%s: fallback_upstreams must not contain the primary upstream %r"
+                               % (where, item))
+        if item in out:
+            raise GatewayError("%s: duplicate fallback upstream %r" % (where, item))
+        out.append(item)
+    return out
+
+
 def _unique(items: List[Any], pick: Callable[[Any], str], label: str) -> None:
     seen = set()
     for item in items:
@@ -79,6 +100,7 @@ class Route:
     quota_policy: Optional[str] = None
     timeout_ms: int = 5000
     scopes: List[str] = field(default_factory=list)
+    fallback_upstreams: List[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "route") -> "Route":
@@ -96,15 +118,17 @@ class Route:
         if weight < 1 or timeout_ms < 1:
             raise GatewayError("%s: weight and timeout_ms must be >= 1" % where)
         transform = _get(data, "transform", dict, where, default={})
+        upstream = _get(data, "upstream", str, where, required=True)
         return cls(id=route_id, tenant=_get(data, "tenant", str, where, default=ANY_TENANT),
                    method=method, path_prefix=prefix,
-                   upstream=_get(data, "upstream", str, where, required=True),
+                   upstream=upstream,
                    auth_required=_get(data, "auth_required", bool, where, default=True),
                    weight=weight,
                    request_headers=_str_map(transform, "request_headers", "%s transform" % where),
                    response_headers=_str_map(transform, "response_headers", "%s transform" % where),
                    quota_policy=_get(data, "quota_policy", str, where),
-                   timeout_ms=timeout_ms, scopes=_str_list(data, "scopes", where))
+                   timeout_ms=timeout_ms, scopes=_str_list(data, "scopes", where),
+                   fallback_upstreams=_fallback_list(data, upstream, where))
 
     def to_dict(self) -> Dict[str, Any]:
         return {"id": self.id, "tenant": self.tenant,
@@ -112,6 +136,7 @@ class Route:
                 "upstream": self.upstream, "auth_required": self.auth_required,
                 "weight": self.weight, "quota_policy": self.quota_policy,
                 "timeout_ms": self.timeout_ms, "scopes": list(self.scopes),
+                "fallback_upstreams": list(self.fallback_upstreams),
                 "transform": {"request_headers": dict(self.request_headers),
                               "response_headers": dict(self.response_headers)}}
 

@@ -13,7 +13,7 @@ configure.
 ## Running it
 
 ```bash
-# 1. run the test suite (82 tests, no network, no sleeping)
+# 1. run the test suite (99 tests, no network, no sleeping)
 python3 -m unittest discover -s tests -v
 
 # 2. start the gateway
@@ -69,10 +69,14 @@ tests; only the HTTP front end reads the wall clock.
    while resolving a partition (`400`/`401`/`403`) consume no quota, write no
    usage and never call the upstream, but are still audited.
 5. **Idempotency.** See below; a replay short circuits the rest of the pipeline.
-6. **Circuit breaker + retries.** One breaker per upstream name; an open breaker
-   returns `503 {"error":"upstream unavailable","state":"open"}` without calling
-   the upstream. Only `408, 429, 500, 502, 503, 504` and transport errors are
-   retried, bounded by `RetryPolicy(max_attempts, base_ms, max_ms)`.
+6. **Circuit breaker + retries + fallback.** One breaker per upstream name; an
+   open breaker returns `503 {"error":"upstream unavailable","state":"open"}`
+   without calling the upstream. Only `408, 429, 500, 502, 503, 504` and
+   transport errors are retried, bounded by `RetryPolicy(max_attempts, base_ms,
+   max_ms)`. When the route names `fallback_upstreams`, an eligible request
+   (see below) that exhausts its retries on a transport error or a `5xx` fails
+   over to the next upstream in order; any other status is returned
+   immediately. See [Fallback upstreams](#fallback-upstreams).
 7. **Transforms.** `transform.request_headers` are added to the upstream call,
    `transform.response_headers` are added to the reply. Credential headers
    (`Authorization`, `X-Api-Key`) and hop-by-hop headers are stripped before the
@@ -110,6 +114,44 @@ A request carrying `X-Idempotency-Key` is scoped by `(tenant, key)`:
   and never calls the upstream again;
 * the same key with a **different** body hash -> `409`;
 * nothing is stored for `5xx`/transport failures, so a failed call can be retried.
+
+## Fallback upstreams (documented rule)
+
+A route may name `fallback_upstreams`, an ordered array of backup upstream
+names tried after the primary. Omitting the field means `[]` (no failover, the
+historical behaviour). Every element must be a non-empty upstream name string;
+duplicates and the primary upstream itself are rejected, and so are `null`,
+non-arrays and non-string elements — all with a `GatewayError` (`400` style
+single-line JSON on the CLI, non-zero exit, configuration unchanged).
+
+Failover is only offered to **GET requests** and requests carrying a
+**non-empty `X-Idempotency-Key`**; every other request calls the primary
+upstream only. For an eligible request the candidates are the primary followed
+by the fallbacks in order:
+
+* each candidate keeps its own circuit breaker and its own retry budget — a
+  breaker-rejected candidate is skipped without a call;
+* a candidate is called with the usual retry policy; when its retries end on a
+  **transport error or a `5xx`** the next candidate is tried, and any other
+  status (`2xx`/`3xx`/`4xx`, including a retried `408`/`429`) is returned
+  immediately;
+* an unregistered upstream name behaves as a transport error;
+* every call keeps the original method, path, body, header transforms and
+  credential stripping, and the weighted route pick is unaffected.
+
+When the chain is exhausted the result of the last upstream actually called is
+returned (a transport failure is the usual `502`, an HTTP response keeps its
+status, body and response-header handling). When every candidate was skipped
+by its breaker the response is the usual `503`, with `state` taken from the
+primary upstream's rejection. The whole request is still billed and audited
+exactly once: `attempts` sums the actual calls across all upstreams and
+`upstream` names the last upstream actually called (the primary when none
+was). The idempotency cache stores only the final non-`5xx` response, so a
+replay never re-runs the failover and a final `5xx` or transport failure is
+never cached. A valid hot reload applies the new order to new requests only
+(in-flight requests keep the order they started with) and never resets quota
+buckets or breaker state; an invalid reload keeps the last good configuration,
+buckets, breakers and health feedback.
 
 ## Rate limit algorithms
 
@@ -189,6 +231,7 @@ health state, error feedback and every bucket.
     "id": "r-api", "tenant": "acme",
     "match": {"method": "GET", "path_prefix": "/api"},
     "upstream": "echo",
+    "fallback_upstreams": ["echo-dr"],
     "auth_required": true, "weight": 1, "scopes": ["read"],
     "transform": {"request_headers": {"X-Tenant": "acme"},
                   "response_headers": {"X-Served-By": "gwd"}},
@@ -204,12 +247,14 @@ health state, error feedback and every bucket.
 
 `scopes` defaults to `[]` (no scope required); a key holding the `*` scope
 satisfies any requirement. `tenant: "*"` marks a route shared by every tenant.
+`fallback_upstreams` defaults to `[]` and lists backup upstreams in failover
+order (see [Fallback upstreams](#fallback-upstreams)).
 `partition_by` defaults to `"policy"` and accepts only `"policy"`, `"tenant"`
 and `"key"` (see [Quota partitions](#quota-partitions)). `load()` rejects
 malformed documents with `GatewayError` (unknown algorithm, an invalid
 `partition_by`, non-positive `limit`/`window_ms`/`burst`/`weight`,
 `path_prefix` without a leading `/`, malformed `secret_sha256`, duplicate ids, a
-route naming an unknown quota policy). `reload_if_changed()` re-reads the file
+route naming an unknown quota policy, an invalid `fallback_upstreams`). `reload_if_changed()` re-reads the file
 only when its mtime moved and keeps `ready` true only when the new document is
 valid; an invalid reload keeps the last known good config, sets `ready = false`
 and records `last_error`.

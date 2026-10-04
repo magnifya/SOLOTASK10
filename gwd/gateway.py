@@ -245,30 +245,52 @@ class Gateway:
                     return finish(replay["status"], body_text=replay["body"],
                                   extra_headers=replay_headers, replay=True)
 
-        # 5. circuit breaker and upstream call with retries
+        # 5. circuit breaker and upstream call with retries, then ordered fallback.
+        # Failover is only offered to GET requests and requests carrying a
+        # non-empty X-Idempotency-Key; every other request calls the primary only.
         upstream_name = route.upstream
-        breaker = self.breakers.get(upstream_name)
-        if not breaker.allow(now):
-            return finish(503, {"error": "upstream unavailable", "state": breaker.state,
-                                "request_id": request_id})
+        chain = [route.upstream]
+        if method == "GET" or hdrs.get("x-idempotency-key"):
+            chain.extend(route.fallback_upstreams)
         request = {"method": method, "path": path, "body": body, "tenant": tenant,
                    "request_id": request_id, "headers": self._upstream_headers(hdrs, route)}
         response = None
         status = TRANSPORT_ERROR
-        while attempts < self.retry_policy.max_attempts:
-            attempts += 1
-            try:
-                response = self.upstreams.call(upstream_name, request, route.timeout_ms)
-                status = int(response["status"])
-            except UpstreamError:
-                response = None
-                status = TRANSPORT_ERROR
-            if not self.retry_policy.should_retry(attempts, status):
-                break
-            if self.sleep_fn is not None:
-                self.sleep_fn(self.retry_policy.delay_ms(attempts))
-        breaker.record(status != TRANSPORT_ERROR and status < 500, now)
+        called = False
+        rejected_state: Optional[str] = None
+        for name in chain:
+            breaker = self.breakers.get(name)
+            if not breaker.allow(now):
+                # A breaker-rejected upstream is never called; remember the
+                # primary's state in case every candidate is skipped.
+                if rejected_state is None:
+                    rejected_state = breaker.state
+                continue
+            called = True
+            upstream_name = name
+            response = None
+            status = TRANSPORT_ERROR
+            attempt = 0
+            while attempt < self.retry_policy.max_attempts:
+                attempt += 1
+                attempts += 1
+                try:
+                    response = self.upstreams.call(name, request, route.timeout_ms)
+                    status = int(response["status"])
+                except UpstreamError:
+                    response = None
+                    status = TRANSPORT_ERROR
+                if not self.retry_policy.should_retry(attempt, status):
+                    break
+                if self.sleep_fn is not None:
+                    self.sleep_fn(self.retry_policy.delay_ms(attempt))
+            breaker.record(status != TRANSPORT_ERROR and status < 500, now)
+            if status != TRANSPORT_ERROR and status < 500:
+                break  # a definitive answer: only transport errors and 5xx fail over
 
+        if not called:
+            return finish(503, {"error": "upstream unavailable", "state": rejected_state,
+                                "request_id": request_id})
         if status == TRANSPORT_ERROR:
             return finish(502, {"error": "upstream error", "request_id": request_id,
                                 "upstream": upstream_name})
