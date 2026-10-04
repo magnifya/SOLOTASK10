@@ -9,8 +9,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 from collections import deque
-from typing import Any, Deque, Dict, Iterable, List, Optional
+from typing import Any, Deque, Dict, Iterable, List, Optional, Tuple
 
 from .config import GatewayError, QuotaPolicy
 
@@ -141,11 +142,19 @@ def make_bucket(policy: QuotaPolicy):
 
 
 class Limiter:
-    """Registry of policy id -> bucket; unchanged buckets keep their state."""
+    """Registry of ``(policy id, partition)`` -> bucket; unchanged buckets keep state.
+
+    ``partition`` is the empty string for ``partition_by: policy`` (one shared
+    bucket per policy), a tenant name for ``partition_by: tenant`` and
+    ``"<tenant>|<key_id>"`` for ``partition_by: key``. A lock serialises the
+    check-and-spend inside ``allow`` so concurrent requests on the same
+    partition can never overspend.
+    """
 
     def __init__(self, policies: Optional[Iterable[Any]] = None) -> None:
         self._policies: Dict[str, QuotaPolicy] = {}
-        self._buckets: Dict[str, tuple] = {}
+        self._buckets: Dict[Tuple[str, str], tuple] = {}
+        self._lock = threading.Lock()
         if policies:
             self.sync(policies)
 
@@ -154,26 +163,35 @@ class Limiter:
         for item in policies:
             policy = item if isinstance(item, QuotaPolicy) else QuotaPolicy.from_dict(item)
             wanted[policy.id] = policy
-        self._buckets = {k: v for k, v in self._buckets.items() if k in wanted}
-        self._policies = wanted
+        with self._lock:
+            # Drop buckets of removed policies and of policies whose tenant,
+            # partition mode or algorithm parameters changed; those partitions
+            # restart from the initial state. Unchanged policies keep state.
+            self._buckets = {slot: entry for slot, entry in self._buckets.items()
+                             if slot[0] in wanted and entry[0] == wanted[slot[0]].signature()}
+            self._policies = wanted
 
     def set_policy(self, policy: Any) -> QuotaPolicy:
         parsed = policy if isinstance(policy, QuotaPolicy) else QuotaPolicy.from_dict(policy)
-        self._policies[parsed.id] = parsed
+        with self._lock:
+            self._policies[parsed.id] = parsed
         return parsed
 
-    def bucket(self, policy_id: str):
+    def bucket(self, policy_id: str, partition: str = ""):
         policy = self._policies.get(policy_id)
         if policy is None:
             raise GatewayError("unknown quota policy: %s" % policy_id, 404)
-        current = self._buckets.get(policy_id)
+        slot = (policy_id, partition or "")
+        current = self._buckets.get(slot)
         if current is None or current[0] != policy.signature():
             current = (policy.signature(), make_bucket(policy))
-            self._buckets[policy_id] = current
+            self._buckets[slot] = current
         return current[1]
 
-    def allow(self, policy_id: str, cost: int = 1, now_ms: int = 0) -> Dict[str, Any]:
-        result = self.bucket(policy_id).allow(cost, now_ms)
+    def allow(self, policy_id: str, cost: int = 1, now_ms: int = 0,
+              partition: str = "") -> Dict[str, Any]:
+        with self._lock:
+            result = self.bucket(policy_id, partition).allow(cost, now_ms)
         result["policy_id"] = policy_id
         return result
 

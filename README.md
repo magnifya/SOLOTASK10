@@ -13,7 +13,7 @@ configure.
 ## Running it
 
 ```bash
-# 1. run the test suite (66 tests, no network, no sleeping)
+# 1. run the test suite (94 tests, no network, no sleeping)
 python3 -m unittest discover -s tests -v
 
 # 2. start the gateway
@@ -62,9 +62,13 @@ tests; only the HTTP front end reads the wall clock.
    or a missing route scope -> `403`. Routes with `"auth_required": false` skip
    this step. Only `sha256(secret)` is ever stored, and it is compared in constant
    time.
-4. **Quota.** If the route names a `quota_policy`, one unit is charged. A rejected
-   request gets `429` with `policy_id` and `reset_at_ms` plus a `Retry-After`
-   header, and the *rejected attempt is still written to the ledger*.
+4. **Quota.** If the route names a `quota_policy`, one unit is charged against the
+   policy's *partition* (see below). A rejected request gets `429` with
+   `policy_id` and `reset_at_ms` plus a `Retry-After` header, and the *rejected
+   attempt is still written to the ledger*. When the partition identity cannot
+   be established the request is denied (`400`/`401`/`403`, see below) without
+   consuming quota, writing usage or calling the upstream - but it is still
+   audited.
 5. **Idempotency.** See below; a replay short circuits the rest of the pipeline.
 6. **Circuit breaker + retries.** One breaker per upstream name; an open breaker
    returns `503 {"error":"upstream unavailable","state":"open"}` without calling
@@ -126,6 +130,36 @@ bucket allows an initial burst of `limit` and then sustains `limit` per
 `window_ms`; the leaky bucket rejects as soon as the queue would overflow; the
 sliding window is the exact count of timestamps in the trailing window.
 
+### Quota partitions (`partition_by`)
+
+Every quota policy carries a `partition_by` mode - `policy` (the default when
+the field is omitted), `tenant` or `key`. Each partition gets its own bucket
+with its own remaining quota and reset time, computed by the same algorithm
+with the same `limit`/`window_ms`/`burst` rules:
+
+| Mode | Partition identity |
+| --- | --- |
+| `policy` | one bucket shared by every caller of the policy |
+| `tenant` | the owning tenant of a valid API key; anonymous callers use the request tenant (empty tenant -> `400`) |
+| `key` | `<owning tenant>|<key_id>` of a valid API key; one key shares its bucket across routes |
+
+The identity is resolved at the quota check. In `key` mode a missing key, an
+unknown secret or a stated `X-Api-Key` that does not match the secret is a
+`401` - even on routes with `"auth_required": false`. In both partitioned
+modes a valid key whose tenant contradicts an explicitly stated request tenant
+is a `403`. These denials never consume quota, never write usage and never
+call the upstream, but they are audited like any other request.
+
+Hot reload keeps the partition state of a policy only while its `id`, `tenant`,
+`partition_by` and algorithm parameters are all unchanged; changing any of
+them (or deleting and re-adding the policy) restarts every partition of that
+policy from the initial state. An invalid reload keeps the last good config
+and its quota state. `partition_by` must be one of the three mode strings -
+`null`, an empty string, another value or a non-string is rejected with
+`GatewayError` on load, `400` over HTTP and the standard CLI error format, in
+every case without changing the live config or quotas. Concurrent requests on
+the same partition are serialised so they can never overspend.
+
 `QuotaLedger` appends one JSON object per line to `<data-dir>/usage.jsonl`
 (`at`, `tenant`, `policy_id`, `key_id`, `cost`, `allowed`) with a single `write`
 call per entry, so a crash can only leave a torn trailing line, which readers
@@ -148,7 +182,8 @@ overall and per policy.
   "keys": [{"key_id": "k-1", "tenant": "acme",
             "secret_sha256": "<64 lowercase hex>", "scopes": ["read"]}],
   "quota_policies": [{"id": "p-api", "tenant": "acme", "algorithm": "token-bucket",
-                      "limit": 10, "window_ms": 1000, "burst": 20}]
+                      "limit": 10, "window_ms": 1000, "burst": 20,
+                      "partition_by": "tenant"}]
 }
 ```
 

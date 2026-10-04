@@ -163,6 +163,7 @@ class Gateway:
                     "request_id": request_id, "route_id": route.id if route else None}
 
         key, auth_error = self._resolve_key(hdrs)
+        explicit_tenant = tenant
         tenant = tenant or (key.tenant if key else "")
         candidates = self.config.matching_routes(method, path, tenant)
         if not candidates:
@@ -188,7 +189,12 @@ class Gateway:
 
         # 3. quota
         if route.quota_policy:
-            result = self.limiter.allow(route.quota_policy, 1, now)
+            partition, denial = self._quota_partition(route, key, auth_error,
+                                                      explicit_tenant, tenant)
+            if denial is not None:
+                status, message = denial
+                return finish(status, {"error": message, "request_id": request_id})
+            result = self.limiter.allow(route.quota_policy, 1, now, partition)
             quota = {"policy_id": route.quota_policy, "allowed": result["allowed"],
                      "remaining": result["remaining"]}
             self.ledger.record(tenant, route.quota_policy, key.key_id if key else None, 1,
@@ -253,6 +259,35 @@ class Gateway:
         return finish(status, body_text=text, extra_headers=response.get("headers") if response else None)
 
     # ---------------------------------------------------------------- helpers
+    def _quota_partition(self, route: Route, key: Optional[ApiKey],
+                         auth_error: Optional[str], explicit_tenant: str,
+                         tenant: str) -> Tuple[str, Optional[Tuple[int, str]]]:
+        """Resolve the quota partition identity for one request.
+
+        Returns ``(partition, None)`` to proceed, or ``(None, (status, message))``
+        when the partition identity cannot be established; the caller then
+        rejects without charging quota, recording usage or calling the upstream
+        (the audit entry is still written by ``finish``).
+        """
+        policy = next((p for p in self.config.policies if p.id == route.quota_policy), None)
+        mode = policy.partition_by if policy else "policy"
+        if mode == "policy":
+            return "", None
+        if key is not None:
+            if explicit_tenant and key.tenant != explicit_tenant:
+                return None, (403, "api key tenant %r does not match request tenant %r"
+                                   % (key.tenant, explicit_tenant))
+            if mode == "key":
+                return "%s|%s" % (key.tenant, key.key_id), None
+            return key.tenant, None
+        if mode == "key":
+            # A key partition needs a valid key even on anonymous routes.
+            return None, (401, auth_error or "missing api key")
+        if not tenant:
+            return None, (400, "tenant is required to partition quota policy %s"
+                               % route.quota_policy)
+        return tenant, None
+
     def _remember(self, idem_key: str, body_hash: str, now: int, status: int, text: str) -> None:
         if len(self._idempotency) > 1024:
             self._idempotency = {k: v for k, v in self._idempotency.items() if v["expires_ms"] > now}
