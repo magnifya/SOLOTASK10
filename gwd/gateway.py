@@ -217,6 +217,13 @@ class Gateway:
             if route:
                 out_headers.update(route.response_headers)
             out_headers.update(extra_headers or {})
+            if route and route.version is not None:
+                # The selected route's version always wins, even over a
+                # transform.response_headers entry with the same name.
+                for name in [name for name in out_headers
+                             if name.lower() == "x-api-version"]:
+                    del out_headers[name]
+                out_headers["X-Api-Version"] = route.version
             return {"status": int(status), "headers": out_headers, "body": text,
                     "request_id": request_id, "route_id": route.id if route else None}
 
@@ -230,6 +237,23 @@ class Gateway:
             candidates = self.config.matching_routes(method, path, None)
         if not candidates:
             return finish(404, {"error": "no route for %s %s" % (method, path), "request_id": request_id})
+        # API version filter: a missing or blank X-Api-Version header reaches
+        # only unversioned routes; a non-blank value reaches only routes that
+        # declared exactly that (case-sensitive) version -- unversioned routes
+        # are never a fallback for a versioned request.
+        requested_version = (hdrs.get("x-api-version") or "").strip()
+        supported_versions = sorted({r.version for r in candidates if r.version is not None})
+        if requested_version:
+            candidates = [r for r in candidates if r.version == requested_version]
+        else:
+            candidates = [r for r in candidates if r.version is None]
+        if not candidates:
+            # Rejected before auth, quota, idempotency or any upstream call;
+            # the audit record keeps route_id null and attempts 0.
+            return finish(406, {"error": "unsupported api version",
+                                "requested_version": requested_version or None,
+                                "supported_versions": supported_versions,
+                                "request_id": request_id})
         selector = "%s|%s" % (key.key_id if key else "-", request_id)
         route = self._pick_route(candidates, selector)
         joint = route.quota_policies is not None

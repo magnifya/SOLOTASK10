@@ -97,6 +97,18 @@ def _quota_policy_list(data: Dict[str, Any], key: str, where: str) -> Optional[L
     return out
 
 
+def _version_value(data: Dict[str, Any], where: str) -> Optional[str]:
+    """Optional API version: omitted means an unversioned (legacy) route; when
+    present it must be a non-empty string -- null, an empty string or any other
+    type is rejected."""
+    if "version" not in data:
+        return None
+    raw = data["version"]
+    if not isinstance(raw, str) or not raw:
+        raise GatewayError("%s: version must be a non-empty string" % where)
+    return raw
+
+
 def _unique(items: List[Any], pick: Callable[[Any], str], label: str) -> None:
     seen = set()
     for item in items:
@@ -123,6 +135,7 @@ class Route:
     timeout_ms: int = 5000
     scopes: List[str] = field(default_factory=list)
     fallback_upstreams: List[str] = field(default_factory=list)
+    version: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "route") -> "Route":
@@ -156,7 +169,8 @@ class Route:
                    quota_policy=quota_policy,
                    quota_policies=quota_policies,
                    timeout_ms=timeout_ms, scopes=_str_list(data, "scopes", where),
-                   fallback_upstreams=_fallback_list(data, "fallback_upstreams", where, upstream))
+                   fallback_upstreams=_fallback_list(data, "fallback_upstreams", where, upstream),
+                   version=_version_value(data, where))
 
     def to_dict(self) -> Dict[str, Any]:
         out = {"id": self.id, "tenant": self.tenant,
@@ -169,6 +183,8 @@ class Route:
                              "response_headers": dict(self.response_headers)}}
         if self.quota_policies is not None:
             out["quota_policies"] = list(self.quota_policies)
+        if self.version is not None:
+            out["version"] = self.version
         return out
 
     def matches(self, method: str, path: str, tenant: Optional[str]) -> bool:

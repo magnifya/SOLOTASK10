@@ -55,16 +55,30 @@ tests; only the HTTP front end reads the wall clock.
    `*` or equals the request tenant. If nothing matches the tenant, matching is
    retried with the tenant filter relaxed so that a request without a valid key is
    rejected by authentication (401/403) rather than reported as 404.
-2. **Weighted pick.** Among candidates the longest `path_prefix` wins. Ties are
+2. **API version filter.** A route may declare an optional `version` (a non-empty
+   string; `null`, `""` or any other type is rejected at load and in
+   `route-add`). A request without `X-Api-Version` (or with a blank one) reaches
+   only unversioned routes; a non-blank value reaches only routes that declared
+   exactly that case-sensitive string — unversioned routes are never a fallback.
+   When method/path/tenant produced candidates but the version filter empties
+   them, the gateway answers `406` with `{"error": "unsupported api version",
+   "requested_version", "supported_versions", "request_id"}`
+   (`requested_version` is `null` when the header was absent;
+   `supported_versions` is the sorted, de-duplicated set of versions declared by
+   the candidates) before auth, quota, idempotency or any upstream call, and
+   writes one audit record with `route_id: null` and `attempts: 0`. A versioned
+   route's replies carry `X-Api-Version: <version>`, overriding any
+   `transform.response_headers` entry of the same name.
+3. **Weighted pick.** Among candidates the longest `path_prefix` wins. Ties are
    resolved by weighted stable hashing (see below).
-3. **Auth.** Missing or unknown secret -> `401`; a stated `X-Api-Key` that does not
+4. **Auth.** Missing or unknown secret -> `401`; a stated `X-Api-Key` that does not
    match the presented secret -> `401`; a disabled or expired key -> `401`
    (`api key disabled` / `api key expired`, see
    [Key disabling and expiry](#key-disabling-and-expiry)); key tenant different
    from the route tenant, or a missing route scope -> `403`. Routes with
    `"auth_required": false` skip this step. Only `sha256(secret)` is ever stored,
    and it is compared in constant time.
-4. **Quota.** A route names one policy (`quota_policy`, the historical form) or
+5. **Quota.** A route names one policy (`quota_policy`, the historical form) or
    an ordered, non-empty list (`quota_policies`, joint admission). Each named
    policy charges one unit against the partition resolved for that policy (see
    below). For a joint check, partition identities are verified in declaration
@@ -76,9 +90,9 @@ tests; only the HTTP front end reads the wall clock.
    still written to the ledger* (one entry per named policy). Identity
    rejections raised while resolving a partition (`400`/`401`/`403`) consume no
    quota, write no usage and never call the upstream, but are still audited.
-5. **Idempotency.** See below; a replay short circuits the rest of the pipeline,
+6. **Idempotency.** See below; a replay short circuits the rest of the pipeline,
    and a request that meets one still in flight is rejected immediately (425/409).
-6. **Circuit breaker + retries + failover.** One breaker per upstream name; an
+7. **Circuit breaker + retries + failover.** One breaker per upstream name; an
    open breaker returns `503 {"error":"upstream unavailable","state":"open"}`
    without calling the upstream. Only `408, 429, 500, 502, 503, 504` and
    transport errors are retried, bounded by `RetryPolicy(max_attempts, base_ms,
@@ -88,11 +102,11 @@ tests; only the HTTP front end reads the wall clock.
    breaker rejection skips it silently, and only a transport error or a 5xx
    left after the retries moves to the next upstream (see
    [Fallback upstreams](#fallback-upstreams)).
-7. **Transforms.** `transform.request_headers` are added to the upstream call,
+8. **Transforms.** `transform.request_headers` are added to the upstream call,
    `transform.response_headers` are added to the reply. Credential headers
    (`Authorization`, `X-Api-Key`) and hop-by-hop headers are stripped before the
    upstream call.
-8. **Audit.** One JSON line per request is appended to `<data-dir>/audit.jsonl`
+9. **Audit.** One JSON line per request is appended to `<data-dir>/audit.jsonl`
    with `at`, `request_id`, `tenant`, `key_id`, `route_id`, `upstream`, `status`,
    `latency_ms`, `attempts`, `quota{policy_id,allowed,remaining}` and
    `idempotent_replay`. A `quota_policies` route additionally carries `quotas`,
@@ -394,7 +408,7 @@ feedback through the usual `ready` / `last_error` channel.
     "transform": {"request_headers": {"X-Tenant": "acme"},
                   "response_headers": {"X-Served-By": "gwd"}},
     "quota_policy": "p-api", "timeout_ms": 5000,
-    "fallback_upstreams": ["echo-dr"]
+    "fallback_upstreams": ["echo-dr"], "version": "v1"
   }, {
     "id": "r-both", "tenant": "acme",
     "match": {"method": "GET", "path_prefix": "/both"},
@@ -421,10 +435,14 @@ satisfies any requirement. `tenant: "*"` marks a route shared by every tenant.
 `partition_by` defaults to `"policy"` and accepts only `"policy"`, `"tenant"`
 and `"key"` (see [Quota partitions](#quota-partitions)). `fallback_upstreams`
 defaults to `[]` and lists the ordered failover upstreams (see
-[Fallback upstreams](#fallback-upstreams)). `load()` rejects
+[Fallback upstreams](#fallback-upstreams)). `version` is optional; when present
+it must be a non-empty string and it opts the route into API version filtering
+(see [Request pipeline](#request-pipeline)) — the sanitized `GET /v1/config`
+echoes `version` only on routes that declared it. `load()` rejects
 malformed documents with `GatewayError` (unknown algorithm, an invalid
 `partition_by`, an invalid `fallback_upstreams`, a non-boolean `enabled`, an
-invalid `expires_at_ms`, non-positive
+invalid `expires_at_ms`, a `version` that is null, empty or not a string,
+non-positive
 `limit`/`window_ms`/`burst`/`weight`,
 `path_prefix` without a leading `/`, malformed `secret_sha256`, duplicate ids, a
 route naming an unknown quota policy, or a malformed `quota_policies` — `null`,
