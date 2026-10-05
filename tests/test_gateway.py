@@ -430,7 +430,8 @@ class PartitionQuotaTest(unittest.TestCase):
         self.gateway.handle("acme", "GET", "/t", self.key(), "", now_ms=1234)
         entry = self.gateway.audit("acme", 1)[0]
         self.assertEqual(entry["quota"],
-                         {"policy_id": "p-tenant", "allowed": True, "remaining": 1})
+                         {"policy_id": "p-tenant", "allowed": True, "remaining": 1,
+                          "cost": 1})
 
     def test_hot_reload_preserves_then_resets_partition_buckets(self):
         for _ in range(2):
@@ -641,7 +642,8 @@ class TransformAndAuditTest(GatewayTestCase):
         self.assertEqual(entry["status"], 200)
         self.assertEqual(entry["attempts"], 1)
         self.assertIsInstance(entry["latency_ms"], int)
-        self.assertEqual(entry["quota"], {"policy_id": "p-fast", "allowed": True, "remaining": 1})
+        self.assertEqual(entry["quota"], {"policy_id": "p-fast", "allowed": True,
+                                          "remaining": 1, "cost": 1})
         self.assertEqual(self.gateway.audit("nobody"), [])
         self.assertEqual(len(self.gateway.audit("acme", 1)), 1)
 

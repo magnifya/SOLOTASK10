@@ -154,6 +154,10 @@ class SlidingWindow:
         remaining = max(0, self.limit - len(self.stamps))
         if remaining >= cost:
             reset_at_ms = now_ms
+        elif not self.stamps:
+            # A fixed cost above the whole limit can never be admitted; with no
+            # recorded stamp the earliest full availability is one window out.
+            reset_at_ms = now_ms + self.window_ms
         else:  # the (cost - remaining)-th oldest stamp has to expire first
             index = max(0, min(len(self.stamps) - self.limit + cost - 1, len(self.stamps) - 1))
             reset_at_ms = self.stamps[index] + self.window_ms
@@ -172,6 +176,8 @@ class SlidingWindow:
         remaining = max(0, self.limit - count)
         if allowed:
             reset_at_ms = now_ms
+        elif not live:
+            reset_at_ms = now_ms + self.window_ms
         else:  # same recovery stamp ``allow`` computes for a rejected request
             index = max(0, min(count - self.limit + cost - 1, count - 1))
             reset_at_ms = live[index] + self.window_ms

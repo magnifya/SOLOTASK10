@@ -257,6 +257,11 @@ class Gateway:
         selector = "%s|%s" % (key.key_id if key else "-", request_id)
         route = self._pick_route(candidates, selector)
         joint = route.quota_policies is not None
+        # The fixed cost is read once from the selected route snapshot and
+        # rides the whole pipeline: a hot reload swapping the config mid-request
+        # keeps this local route object, so in-flight requests are always billed
+        # at the cost they started with.
+        cost = int(route.quota_cost)
 
         # 2. authentication and authorisation
         if route.auth_required:
@@ -310,20 +315,24 @@ class Gateway:
                 return finish(error_status,
                               {"error": error_message, "request_id": request_id})
             if joint:
-                results = self.limiter.allow_group(checks, 1, now)
+                results = self.limiter.allow_group(checks, cost, now)
             else:
                 only_id, only_partition = checks[0]
-                results = [self.limiter.allow(only_id, 1, now, partition=only_partition)]
+                results = [self.limiter.allow(only_id, cost, now, partition=only_partition)]
             # ``allowed`` always reflects the whole group: a usage record is
             # written per policy, but the request is admitted only when every
             # policy had room.
             group_allowed = all(result["allowed"] for result in results)
             quotas = [{"policy_id": result["policy_id"], "allowed": group_allowed,
-                       "remaining": result["remaining"]} for result in results]
+                       "remaining": result["remaining"], "cost": cost}
+                      for result in results]
             quota = dict(quotas[0])
             for result in results:
+                # Exactly one ledger line per named policy per request, each
+                # carrying this request's full fixed cost; retries, failover
+                # and an idempotent replay never pass through here twice.
                 self.ledger.record(tenant, result["policy_id"],
-                                   key.key_id if key else None, 1, group_allowed, now)
+                                   key.key_id if key else None, cost, group_allowed, now)
             if not group_allowed:
                 insufficient = [result for result in results if not result["allowed"]]
                 first_short = next(result for result in results if not result["allowed"])

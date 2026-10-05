@@ -228,10 +228,10 @@ class JointAdmissionTest(unittest.TestCase):
         self.assertEqual(set(by_policy), {"p-total", "p-key"})
         entry = self.gateway.audit("acme", 1)[0]
         self.assertEqual(entry["quota"], {"policy_id": "p-total", "allowed": True,
-                                          "remaining": 1})
+                                          "remaining": 1, "cost": 1})
         self.assertEqual(entry["quotas"], [
-            {"policy_id": "p-total", "allowed": True, "remaining": 1},
-            {"policy_id": "p-key", "allowed": True, "remaining": 0}])
+            {"policy_id": "p-total", "allowed": True, "remaining": 1, "cost": 1},
+            {"policy_id": "p-key", "allowed": True, "remaining": 0, "cost": 1}])
 
     def test_second_policy_short_decides_the_429_and_the_first_is_not_charged(self):
         self.assertEqual(self.call()["status"], 200)
@@ -280,8 +280,8 @@ class JointAdmissionTest(unittest.TestCase):
         entry = self.gateway.audit("acme", 1)[0]
         # p-total still held one unit (not deducted); p-key held zero
         self.assertEqual(entry["quotas"], [
-            {"policy_id": "p-total", "allowed": False, "remaining": 1},
-            {"policy_id": "p-key", "allowed": False, "remaining": 0}])
+            {"policy_id": "p-total", "allowed": False, "remaining": 1, "cost": 1},
+            {"policy_id": "p-key", "allowed": False, "remaining": 0, "cost": 1}])
         self.assertEqual(entry["quota"], entry["quotas"][0])
 
     def test_all_three_algorithms_compose_in_one_group(self):
@@ -415,12 +415,15 @@ class JointAdmissionTest(unittest.TestCase):
         entries = self.gateway.audit("acme", 2)
         single, plain = entries[0], entries[1]
         self.assertEqual(single["route_id"], "r-single")
+        # a checked single policy keeps the legacy block plus the actual cost
         self.assertEqual(single["quota"], {"policy_id": "p-total", "allowed": True,
-                                           "remaining": 1})
+                                           "remaining": 1, "cost": 1})
         self.assertNotIn("quotas", single)
         self.assertEqual(plain["route_id"], "r-none")
+        # a route without any quota policy keeps the exact legacy shape
         self.assertEqual(plain["quota"], {"policy_id": None, "allowed": True,
                                           "remaining": None})
+        self.assertNotIn("cost", plain["quota"])
         self.assertNotIn("quotas", plain)
 
     def test_hot_reload_reorders_the_group_without_dropping_buckets(self):
