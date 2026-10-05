@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import secrets
+import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -39,7 +40,11 @@ class Gateway:
         self.breakers = BreakerRegistry(**(breaker_settings or {}))
         self.idempotency_window_ms = int(idempotency_window_ms)
         self.sleep_fn = sleep_fn
-        self._idempotency: Dict[str, Dict[str, Any]] = {}
+        # scope (tenant, full idempotency key) -> stored completed response
+        self._idempotency: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        # scope -> body hash of the single request currently running the chain
+        self._idem_inflight: Dict[Tuple[str, str], str] = {}
+        self._idem_lock = threading.RLock()
         self.sync()
 
     # ------------------------------------------------------------------ state
@@ -271,25 +276,60 @@ class Gateway:
                                     "reset_at_ms": reset_at_ms},
                               extra_headers={"Retry-After": str(retry_after)})
 
-        # 4. idempotency
+        # 4. idempotency. A stored, unexpired response replays immediately. With
+        # nothing usable cached, a non-empty key additionally participates in the
+        # in-progress guard: the scope is the (tenant, full key) pair and only one
+        # request per scope runs the upstream chain at a time. The scope is a
+        # tuple, so values containing the legacy display separator can never
+        # alias another tenant or key.
         body_hash = sha256_hex(body)
-        idem_key = None
+        idem_scope: Optional[Tuple[str, str]] = None
         idem_header = hdrs.get("x-idempotency-key")
         if idem_header:
-            idem_key = "%s|%s" % (tenant, idem_header)
-            stored = self._idempotency.get(idem_key)
-            if stored is not None:
-                if stored["expires_ms"] <= now:
-                    self._idempotency.pop(idem_key, None)
-                elif stored["body_sha256"] != body_hash:
-                    return finish(409, {"error": "idempotency key reused with a different request body",
-                                        "request_id": request_id})
-                else:
-                    replay = dict(stored["response"])
-                    replay_headers = dict(replay.get("headers") or {})
-                    replay_headers[REPLAY_HEADER] = "true"
-                    return finish(replay["status"], body_text=replay["body"],
-                                  extra_headers=replay_headers, replay=True)
+            idem_scope = (tenant, idem_header)
+            # The decision is taken entirely under the lock; the response (and
+            # its audit append) is sent only after releasing it, so disk I/O
+            # never blocks an unrelated scope.
+            shortcut: Optional[Dict[str, Any]] = None
+            with self._idem_lock:
+                stored = self._idempotency.get(idem_scope)
+                if stored is not None:
+                    if stored["expires_ms"] <= now:
+                        self._idempotency.pop(idem_scope, None)
+                    elif stored["body_sha256"] != body_hash:
+                        shortcut = {"status": 409,
+                                    "payload": {"error": "idempotency key reused with a different request body",
+                                                "request_id": request_id}}
+                    else:
+                        replay = dict(stored["response"])
+                        replay_headers = dict(replay.get("headers") or {})
+                        replay_headers[REPLAY_HEADER] = "true"
+                        shortcut = {"status": replay["status"], "body_text": replay["body"],
+                                    "extra_headers": replay_headers, "replay": True}
+                if shortcut is None:
+                    # No usable cache: join the in-progress guard or reject. The
+                    # guard is not bounded by the replay window -- it holds until
+                    # the first request finishes its whole upstream chain -- so a
+                    # late follower whose now_ms passed the window still cannot
+                    # forward.
+                    in_flight_hash = self._idem_inflight.get(idem_scope)
+                    if in_flight_hash is not None:
+                        if in_flight_hash == body_hash:
+                            shortcut = {"status": 425,
+                                        "payload": {"error": "idempotency request in progress",
+                                                    "request_id": request_id},
+                                        "extra_headers": {"Retry-After": "1"}}
+                        else:
+                            shortcut = {"status": 409,
+                                        "payload": {"error": "idempotency key reused with a different request body",
+                                                    "request_id": request_id}}
+                    else:
+                        self._idem_inflight[idem_scope] = body_hash
+            if shortcut is not None:
+                return finish(shortcut["status"], payload=shortcut.get("payload"),
+                              body_text=shortcut.get("body_text"),
+                              extra_headers=shortcut.get("extra_headers"),
+                              replay=shortcut.get("replay", False))
 
         # 5. circuit breaker and upstream call with retries, then failover.
         # Fallback upstreams are considered only for GET requests or requests
@@ -297,61 +337,80 @@ class Gateway:
         # primary upstream alone. Each upstream keeps its own retry budget and
         # breaker; a breaker rejection skips it without a call, and only a
         # transport error or a 5xx left after the retries moves to the next one.
-        if method == "GET" or hdrs.get("x-idempotency-key"):
-            chain = [route.upstream] + list(route.fallback_upstreams)
-        else:
-            chain = [route.upstream]
-        upstream_name = route.upstream
-        request = {"method": method, "path": path, "body": body, "tenant": tenant,
-                   "request_id": request_id, "headers": self._upstream_headers(hdrs, route)}
-        response = None
-        status = TRANSPORT_ERROR
-        rejected_state: Optional[str] = None
-        called = False
-        for name in chain:
-            breaker = self.breakers.get(name)
-            if not breaker.allow(now):
-                if rejected_state is None:
-                    rejected_state = breaker.state
-                continue
-            attempt = 0
-            while attempt < self.retry_policy.max_attempts:
-                attempt += 1
-                attempts += 1
-                try:
-                    response = self.upstreams.call(name, request, route.timeout_ms)
-                    status = int(response["status"])
-                except UpstreamError:
-                    response = None
-                    status = TRANSPORT_ERROR
-                if not self.retry_policy.should_retry(attempt, status):
+        try:
+            if method == "GET" or hdrs.get("x-idempotency-key"):
+                chain = [route.upstream] + list(route.fallback_upstreams)
+            else:
+                chain = [route.upstream]
+            upstream_name = route.upstream
+            request = {"method": method, "path": path, "body": body, "tenant": tenant,
+                       "request_id": request_id, "headers": self._upstream_headers(hdrs, route)}
+            response = None
+            status = TRANSPORT_ERROR
+            rejected_state: Optional[str] = None
+            called = False
+            for name in chain:
+                breaker = self.breakers.get(name)
+                if not breaker.allow(now):
+                    if rejected_state is None:
+                        rejected_state = breaker.state
+                    continue
+                attempt = 0
+                while attempt < self.retry_policy.max_attempts:
+                    attempt += 1
+                    attempts += 1
+                    try:
+                        response = self.upstreams.call(name, request, route.timeout_ms)
+                        status = int(response["status"])
+                    except UpstreamError:
+                        response = None
+                        status = TRANSPORT_ERROR
+                    if not self.retry_policy.should_retry(attempt, status):
+                        break
+                    if self.sleep_fn is not None:
+                        self.sleep_fn(self.retry_policy.delay_ms(attempt))
+                breaker.record(status != TRANSPORT_ERROR and status < 500, now)
+                if attempt:
+                    upstream_name = name
+                    called = True
+                if status != TRANSPORT_ERROR and status < 500:
                     break
-                if self.sleep_fn is not None:
-                    self.sleep_fn(self.retry_policy.delay_ms(attempt))
-            breaker.record(status != TRANSPORT_ERROR and status < 500, now)
-            if attempt:
-                upstream_name = name
-                called = True
-            if status != TRANSPORT_ERROR and status < 500:
-                break
-            # Transport error or 5xx after the retry budget: try the next upstream.
+                # Transport error or 5xx after the retry budget: try the next upstream.
 
-        if not called:
-            return finish(503, {"error": "upstream unavailable", "state": rejected_state,
-                                "request_id": request_id})
-        if status == TRANSPORT_ERROR:
-            return finish(502, {"error": "upstream error", "request_id": request_id,
-                                "upstream": upstream_name})
-        text = response["body"] if response else ""
-        if idem_key and status < 500:
-            self._remember(idem_key, body_hash, now, status, text)
-        return finish(status, body_text=text, extra_headers=response.get("headers") if response else None)
+            if not called:
+                # Every upstream refused at its breaker: a failure, so the guard
+                # is released and nothing is cached; a later request may retry.
+                return finish(503, {"error": "upstream unavailable", "state": rejected_state,
+                                    "request_id": request_id})
+            if status == TRANSPORT_ERROR:
+                return finish(502, {"error": "upstream error", "request_id": request_id,
+                                    "upstream": upstream_name})
+            text = response["body"] if response else ""
+            if status < 500:
+                # Publish the response and end the in-progress state in one
+                # critical section: a follower can never observe the scope as
+                # neither cached nor guarded between the two updates.
+                if idem_scope is not None:
+                    with self._idem_lock:
+                        self._remember(idem_scope, body_hash, now, status, text)
+                        self._idem_inflight.pop(idem_scope, None)
+                idem_scope = None
+                return finish(status, body_text=text,
+                              extra_headers=response.get("headers") if response else None)
+            # Final 5xx: no cache entry and the scope opens back up for retries.
+            return finish(status, body_text=text,
+                          extra_headers=response.get("headers") if response else None)
+        finally:
+            if idem_scope is not None:
+                with self._idem_lock:
+                    self._idem_inflight.pop(idem_scope, None)
 
     # ---------------------------------------------------------------- helpers
-    def _remember(self, idem_key: str, body_hash: str, now: int, status: int, text: str) -> None:
+    def _remember(self, idem_scope: Tuple[str, str], body_hash: str, now: int,
+                  status: int, text: str) -> None:
         if len(self._idempotency) > 1024:
             self._idempotency = {k: v for k, v in self._idempotency.items() if v["expires_ms"] > now}
-        self._idempotency[idem_key] = {
+        self._idempotency[idem_scope] = {
             "body_sha256": body_hash, "expires_ms": now + self.idempotency_window_ms,
             "response": {"status": int(status), "body": text, "headers": {}}}
 

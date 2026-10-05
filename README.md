@@ -13,7 +13,7 @@ configure.
 ## Running it
 
 ```bash
-# 1. run the test suite (136 tests, no network, no sleeping)
+# 1. run the test suite (160 tests, no network, no sleeping)
 python3 -m unittest discover -s tests -v
 
 # 2. start the gateway
@@ -76,7 +76,12 @@ tests; only the HTTP front end reads the wall clock.
    still written to the ledger* (one entry per named policy). Identity
    rejections raised while resolving a partition (`400`/`401`/`403`) consume no
    quota, write no usage and never call the upstream, but are still audited.
-5. **Idempotency.** See below; a replay short circuits the rest of the pipeline.
+5. **Idempotency.** See below; a replay short circuits the rest of the
+   pipeline. With no usable cache, the request claims the in-progress guard
+   for its `(tenant, key)` scope: a same-body concurrent request gets `425`
+   (`Retry-After: 1`) and a different-body one gets `409`, both without an
+   upstream call, while the claim runs the chain alone and releases or
+   publishes only when the chain ends.
 6. **Circuit breaker + retries + failover.** One breaker per upstream name; an
    open breaker returns `503 {"error":"upstream unavailable","state":"open"}`
    without calling the upstream. Only `408, 429, 500, 502, 503, 504` and
@@ -118,7 +123,9 @@ with weights 1 and 3 split traffic 25% / 75%.
 
 ## Idempotency (documented rule)
 
-A request carrying `X-Idempotency-Key` is scoped by `(tenant, key)`:
+A request carrying a non-empty `X-Idempotency-Key` is scoped by the
+`(tenant, key)` pair (kept as a tuple, so a tenant or key value containing the
+display separator `|` cannot alias another scope):
 
 * the body is hashed with sha256;
 * the same key with the **same** body hash inside the window (default 10 minutes,
@@ -127,6 +134,47 @@ A request carrying `X-Idempotency-Key` is scoped by `(tenant, key)`:
   and never calls the upstream again;
 * the same key with a **different** body hash -> `409`;
 * nothing is stored for `5xx`/transport failures, so a failed call can be retried.
+
+### In-progress concurrency guard
+
+After routing, authentication and quota have passed, a request that finds no
+usable cached response also joins the in-progress guard for its
+`(tenant, key)` scope. Only one request per scope runs the upstream chain at a
+time; the request that wins keeps its normal retry budget and fallback
+failover. While it has not finished:
+
+* a concurrent request with the **same** body hash is rejected immediately with
+  `425 {"error":"idempotency request in progress","request_id": ...}` (its own
+  request id) and `Retry-After: 1`;
+* a concurrent request with a **different** body hash gets the existing `409`
+  idempotency conflict;
+* neither rejection calls an upstream and neither carries `X-Idempotent-Replay`.
+
+The guard lasts until the whole upstream chain ends; it is not bounded by the
+replay window, so a follower whose `now_ms` is already beyond the first
+request's cache window is still refused rather than forwarded. When the final
+upstream status is below 500, the response is published and the in-progress
+state cleared in one atomic step (no window in which a duplicate could run);
+within the window same-body requests then replay the stored status and body
+with `X-Idempotent-Replay: true`, and different-body requests keep getting
+`409`. A final `5xx`, a transport failure, or every upstream being refused by
+its breaker returns the usual result to the first request, releases the guard
+and caches nothing, so later requests execute again. The `425`/`409` answers
+used to refuse concurrent requests are themselves never cached.
+
+Different tenants or different full keys are independent scopes and proceed
+concurrently. The state is per `Gateway` instance only. Requests without an
+idempotency key (or with an empty one), the admin surface and the CLI keep
+their existing behaviour.
+
+Quota still runs before idempotency: every request that passes quota is
+charged and recorded on its own (a joint admission is still all-or-nothing),
+including requests later refused with `425`/`409`; retries and failover are
+never billed twice. Authentication and quota rejections never occupy a scope.
+Each request appends exactly one audit entry; an in-progress rejection has
+`attempts: 0`, `idempotent_replay: false`, and its `quota`/`quotas` blocks
+reflect that request's own check. A valid hot reload and response-cache
+pruning preserve both unexpired responses and active in-progress guards.
 
 ## Fallback upstreams
 
@@ -161,7 +209,8 @@ order after the route has been picked by the usual weighted rule:
 
 The whole request is still charged and recorded **once** at the original quota
 check point — retries and failovers are never billed twice, and auth failures,
-quota rejections and idempotency conflicts/replays never reach an upstream.
+quota rejections and idempotency conflicts/replays/in-progress refusals never
+reach an upstream.
 The idempotency cache stores only the final non-`5xx` response; a replay
 short-circuits the pipeline before any failover runs, and a final `5xx` or
 transport failure is never cached. The audit entry stays one line per request:
@@ -330,8 +379,8 @@ Audit stays one line per request: a joint route adds `quotas` (ordered
 `{policy_id, allowed, remaining}`, with `quota` equal to its first item); on
 rejection `remaining` is the un deducted available balance, and when the request
 never reached the joint check `quotas` is `[]` and `quota` keeps its unchecked
-value. Idempotent replays and conflicts still check quota first, and retries,
-failover and the breaker never charge extra. A valid hot reload that only
+value. Idempotent replays, conflicts and in-progress `425` refusals still check
+quota first, and retries, failover and the breaker never charge extra. A valid hot reload that only
 changes a route's policy combination keeps quota buckets, breaker state and the
 idempotency cache; in-flight requests keep the combination they started with,
 and an invalid reload keeps the previous configuration, state and health
@@ -404,7 +453,7 @@ are unauthenticated in this skeleton - front them with your own auth in producti
 | GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | `400` non-integer `since` |
 | GET | `/v1/audit?tenant=&limit=` | `200 {"tenant","count","entries"}` | `400` non-integer `limit` |
 | POST | `/v1/breaker/reset` | `200 {"reset":["upstream",...]}` | `400` bad JSON |
-| * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition), `401` missing/unknown/disabled/expired key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict, `429` quota exceeded, `502` upstream error, `503` breaker open |
+| * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition), `401` missing/unknown/disabled/expired key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict, `425` idempotency request in progress, `429` quota exceeded, `502` upstream error, `503` breaker open |
 
 A `/gw/{path}` prefix on the proxy surface is stripped before matching upstreams,
 so `/gw/api/items` is matched as `/api/items`.
