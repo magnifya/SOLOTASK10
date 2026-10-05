@@ -123,6 +123,7 @@ class Route:
     timeout_ms: int = 5000
     scopes: List[str] = field(default_factory=list)
     fallback_upstreams: List[str] = field(default_factory=list)
+    version: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "route") -> "Route":
@@ -146,6 +147,15 @@ class Route:
         if quota_policy and quota_policies is not None:
             raise GatewayError(
                 "%s: quota_policy and quota_policies cannot both be set" % where)
+        # version is rejected explicitly when present (even null), while an
+        # omitted field keeps the route compatible with unversioned clients.
+        if "version" not in data:
+            version = None
+        else:
+            raw_version = data["version"]
+            if not isinstance(raw_version, str) or not raw_version:
+                raise GatewayError("%s: version must be a non-empty string" % where)
+            version = raw_version
         return cls(id=route_id, tenant=_get(data, "tenant", str, where, default=ANY_TENANT),
                    method=method, path_prefix=prefix,
                    upstream=upstream,
@@ -156,7 +166,8 @@ class Route:
                    quota_policy=quota_policy,
                    quota_policies=quota_policies,
                    timeout_ms=timeout_ms, scopes=_str_list(data, "scopes", where),
-                   fallback_upstreams=_fallback_list(data, "fallback_upstreams", where, upstream))
+                   fallback_upstreams=_fallback_list(data, "fallback_upstreams", where, upstream),
+                   version=version)
 
     def to_dict(self) -> Dict[str, Any]:
         out = {"id": self.id, "tenant": self.tenant,
@@ -169,6 +180,8 @@ class Route:
                              "response_headers": dict(self.response_headers)}}
         if self.quota_policies is not None:
             out["quota_policies"] = list(self.quota_policies)
+        if self.version is not None:
+            out["version"] = self.version
         return out
 
     def matches(self, method: str, path: str, tenant: Optional[str]) -> bool:

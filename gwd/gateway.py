@@ -18,6 +18,7 @@ from .limits import AuditLog, Limiter, QuotaLedger
 from .upstream import UpstreamError, default_registry
 
 REPLAY_HEADER = "X-Idempotent-Replay"
+VERSION_HEADER = "X-Api-Version"
 IN_PROGRESS_ERROR = "idempotency request in progress"
 IN_PROGRESS_RETRY_AFTER = "1"
 CREDENTIAL_HEADERS = ("authorization", "x-api-key", "x-api-key-secret")
@@ -217,6 +218,10 @@ class Gateway:
             if route:
                 out_headers.update(route.response_headers)
             out_headers.update(extra_headers or {})
+            if route is not None and route.version is not None:
+                # The selected route's version always wins, even over a
+                # transform.response_headers entry with the same name.
+                out_headers[VERSION_HEADER] = route.version
             return {"status": int(status), "headers": out_headers, "body": text,
                     "request_id": request_id, "route_id": route.id if route else None}
 
@@ -230,6 +235,23 @@ class Gateway:
             candidates = self.config.matching_routes(method, path, None)
         if not candidates:
             return finish(404, {"error": "no route for %s %s" % (method, path), "request_id": request_id})
+        # API version governance: a missing or blank X-Api-Version header only
+        # reaches unversioned routes; a non-blank value only reaches an exact,
+        # case-sensitive match and unversioned routes are never a fallback.
+        requested_version = (hdrs.get("x-api-version") or "").strip() or None
+        matched = candidates
+        if requested_version is None:
+            candidates = [r for r in matched if r.version is None]
+        else:
+            candidates = [r for r in matched if r.version == requested_version]
+        if not candidates:
+            # 406 is raised before authentication, quota, idempotency and any
+            # upstream call; the audit entry keeps attempts 0 and route_id null.
+            return finish(406, {"error": "unsupported api version",
+                                "requested_version": requested_version,
+                                "supported_versions": sorted(
+                                    {r.version for r in matched if r.version is not None}),
+                                "request_id": request_id})
         selector = "%s|%s" % (key.key_id if key else "-", request_id)
         route = self._pick_route(candidates, selector)
         joint = route.quota_policies is not None
