@@ -13,7 +13,7 @@ configure.
 ## Running it
 
 ```bash
-# 1. run the test suite (136 tests, no network, no sleeping)
+# 1. run the test suite (151 tests, no network, no sleeping)
 python3 -m unittest discover -s tests -v
 
 # 2. start the gateway
@@ -76,7 +76,8 @@ tests; only the HTTP front end reads the wall clock.
    still written to the ledger* (one entry per named policy). Identity
    rejections raised while resolving a partition (`400`/`401`/`403`) consume no
    quota, write no usage and never call the upstream, but are still audited.
-5. **Idempotency.** See below; a replay short circuits the rest of the pipeline.
+5. **Idempotency.** See below; a replay short circuits the rest of the pipeline,
+   and a request that meets one still in flight is rejected immediately (425/409).
 6. **Circuit breaker + retries + failover.** One breaker per upstream name; an
    open breaker returns `503 {"error":"upstream unavailable","state":"open"}`
    without calling the upstream. Only `408, 429, 500, 502, 503, 504` and
@@ -118,7 +119,7 @@ with weights 1 and 3 split traffic 25% / 75%.
 
 ## Idempotency (documented rule)
 
-A request carrying `X-Idempotency-Key` is scoped by `(tenant, key)`:
+A request carrying a non-empty `X-Idempotency-Key` is scoped by `(tenant, key)`:
 
 * the body is hashed with sha256;
 * the same key with the **same** body hash inside the window (default 10 minutes,
@@ -127,6 +128,49 @@ A request carrying `X-Idempotency-Key` is scoped by `(tenant, key)`:
   and never calls the upstream again;
 * the same key with a **different** body hash -> `409`;
 * nothing is stored for `5xx`/transport failures, so a failed call can be retried.
+
+The scope identity is the immutable `(tenant, key)` pair, not a joined string,
+so a `|` (or any other separator byte) appearing inside a tenant or a key value
+can never make two different pairs share a scope. Different tenants or
+different full keys always execute concurrently.
+
+### Concurrent in-flight protection
+
+The admission check runs after routing, authentication and quota, and only a
+request with no finished response to replay participates. The first request to
+reach a scope enters the upstream chain (its retries and fallback failover
+follow the usual rules); while that execution has not ended, the scope holds an
+in-flight marker and every later request in the same scope is rejected without
+calling an upstream and without being cached:
+
+* the **same** body hash -> `425 Too Early` with body
+  `{"error":"idempotency request in progress","request_id":...}`, the current
+  request's own `request_id`, and `Retry-After: 1`;
+* a **different** body hash -> the usual `409` conflict;
+* neither rejection carries `X-Idempotent-Replay`, both audit one entry with
+  `attempts: 0` and `idempotent_replay: false`, and each is still charged
+  independently at the quota step (a joint quota check stays all-or-nothing;
+  retries and failover are never billed twice).
+
+The marker protects the scope for the **whole** upstream chain, regardless of
+the caching window: even when a later request's `now_ms` is already past the
+first request's window, an in-flight scope can neither execute nor replay a
+response that does not exist yet. When the final upstream status is below `500`,
+the marker becomes the cached response inside one critical section — there is no
+gap between publishing the cache and ending the in-flight state in which a
+duplicate could execute — and later same-body requests inside the window replay
+the status and body with `X-Idempotent-Replay: true`; different bodies keep
+getting `409`. A final `5xx`, a transport failure, or a chain whose upstreams
+all refuse through their breakers returns the first request's usual result,
+stores nothing and lifts the protection, so a later request can execute again.
+The `425`/`409` answers used to reject concurrent requests are never cached.
+
+An authentication or quota rejection happens before idempotency admission, so
+it never occupies a scope. A valid hot reload and the internal capacity sweep
+keep every in-flight marker and every unexpired response; the sweep only drops
+expired finished entries. Requests without an idempotency key (or with an empty
+one), the admin endpoints and the CLI keep their historical behaviour. The
+in-flight state lives only in the current gateway process instance.
 
 ## Fallback upstreams
 
@@ -161,7 +205,8 @@ order after the route has been picked by the usual weighted rule:
 
 The whole request is still charged and recorded **once** at the original quota
 check point — retries and failovers are never billed twice, and auth failures,
-quota rejections and idempotency conflicts/replays never reach an upstream.
+quota rejections and idempotency conflicts, replays and in-flight rejections
+never reach an upstream.
 The idempotency cache stores only the final non-`5xx` response; a replay
 short-circuits the pipeline before any failover runs, and a final `5xx` or
 transport failure is never cached. The audit entry stays one line per request:
@@ -404,7 +449,7 @@ are unauthenticated in this skeleton - front them with your own auth in producti
 | GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | `400` non-integer `since` |
 | GET | `/v1/audit?tenant=&limit=` | `200 {"tenant","count","entries"}` | `400` non-integer `limit` |
 | POST | `/v1/breaker/reset` | `200 {"reset":["upstream",...]}` | `400` bad JSON |
-| * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition), `401` missing/unknown/disabled/expired key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict, `429` quota exceeded, `502` upstream error, `503` breaker open |
+| * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition), `401` missing/unknown/disabled/expired key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict (finished or in-flight response with a different body), `425` same idempotency scope still in progress with the same body, `429` quota exceeded, `502` upstream error, `503` breaker open |
 
 A `/gw/{path}` prefix on the proxy surface is stripped before matching upstreams,
 so `/gw/api/items` is matched as `/api/items`.

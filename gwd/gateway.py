@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import secrets
+import threading
 import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -17,9 +18,41 @@ from .limits import AuditLog, Limiter, QuotaLedger
 from .upstream import UpstreamError, default_registry
 
 REPLAY_HEADER = "X-Idempotent-Replay"
+IN_PROGRESS_ERROR = "idempotency request in progress"
+IN_PROGRESS_RETRY_AFTER = "1"
 CREDENTIAL_HEADERS = ("authorization", "x-api-key", "x-api-key-secret")
 HOP_HEADERS = ("host", "content-length", "connection", "transfer-encoding")
 _UNSET = object()
+
+
+class _IdempotencyScope(tuple):
+    """The concurrent identity of an idempotent request: tenant plus the full
+    key value.
+
+    A tuple subclass keeps the scope hashable and immutable while immune to
+    separator characters appearing inside either component -- a key containing
+    ``|`` can never collide with a different ``(tenant, key)`` pair, unlike a
+    flat ``"tenant|key"`` rendering. Construct it with a ``(tenant, key)``
+    pair, not positional members, so the pair always stays one scope.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, pair: Tuple[str, str]) -> "_IdempotencyScope":
+        return tuple.__new__(cls, (str(pair[0]), str(pair[1])))
+
+
+class _InFlight:
+    """Marker held in the idempotency map while a request is running upstream.
+
+    Concurrent requests never wait on it: same body -> immediate ``425``,
+    different body -> immediate ``409``.
+    """
+
+    __slots__ = ("body_sha256",)
+
+    def __init__(self, body_hash: str) -> None:
+        self.body_sha256 = body_hash
 
 
 class Gateway:
@@ -39,7 +72,14 @@ class Gateway:
         self.breakers = BreakerRegistry(**(breaker_settings or {}))
         self.idempotency_window_ms = int(idempotency_window_ms)
         self.sleep_fn = sleep_fn
-        self._idempotency: Dict[str, Dict[str, Any]] = {}
+        # Scope key -> either an _InFlight marker (request running) or the
+        # finished {"body_sha256", "expires_ms", "response"} cache entry.
+        self._idempotency: Dict[_IdempotencyScope, Any] = {}
+        # Serialises admission, lookup and release of idempotency scopes. It is
+        # only ever held over map operations, never over an audit append or an
+        # upstream call: the running request keeps a marker in the map and runs
+        # unlocked, and concurrent callers are rejected against that marker.
+        self._idem_lock = threading.RLock()
         self.sync()
 
     # ------------------------------------------------------------------ state
@@ -273,23 +313,55 @@ class Gateway:
 
         # 4. idempotency
         body_hash = sha256_hex(body)
-        idem_key = None
+        idem_scope: Optional[_IdempotencyScope] = None
+        in_flight: Optional[_InFlight] = None
         idem_header = hdrs.get("x-idempotency-key")
         if idem_header:
-            idem_key = "%s|%s" % (tenant, idem_header)
-            stored = self._idempotency.get(idem_key)
-            if stored is not None:
-                if stored["expires_ms"] <= now:
-                    self._idempotency.pop(idem_key, None)
+            # The scope is the immutable (tenant, full key) pair, never the flat
+            # ``tenant|key`` rendering, so separator characters in either value
+            # cannot merge two scopes.
+            idem_scope = _IdempotencyScope((tenant, idem_header))
+            # ``action`` is decided purely from map state under the lock; the
+            # response and its audit entry are written outside it, so the global
+            # idempotency lock never covers file or upstream I/O.
+            action: Optional[str] = None
+            replay_entry: Optional[Dict[str, Any]] = None
+            with self._idem_lock:
+                stored = self._idempotency.get(idem_scope)
+                if isinstance(stored, _InFlight):
+                    # A request for this scope is still inside the upstream
+                    # chain. The protection outlives the replay window: an
+                    # in-flight marker never expires and never caches anything,
+                    # so a concurrent request can neither execute nor replay a
+                    # response that does not exist yet.
+                    action = ("conflict" if stored.body_sha256 != body_hash
+                              else "in-progress")
+                elif stored is None:
+                    in_flight = _InFlight(body_hash)
+                    self._idempotency[idem_scope] = in_flight
+                elif stored["expires_ms"] <= now:
+                    # Expired response and no request running: this request
+                    # takes over the scope atomically, before any upstream call.
+                    in_flight = _InFlight(body_hash)
+                    self._idempotency[idem_scope] = in_flight
                 elif stored["body_sha256"] != body_hash:
-                    return finish(409, {"error": "idempotency key reused with a different request body",
-                                        "request_id": request_id})
+                    action = "conflict"
                 else:
-                    replay = dict(stored["response"])
-                    replay_headers = dict(replay.get("headers") or {})
-                    replay_headers[REPLAY_HEADER] = "true"
-                    return finish(replay["status"], body_text=replay["body"],
-                                  extra_headers=replay_headers, replay=True)
+                    action = "replay"
+                    replay_entry = stored
+            if action == "in-progress":
+                return finish(425, {"error": IN_PROGRESS_ERROR,
+                                    "request_id": request_id},
+                              extra_headers={"Retry-After": IN_PROGRESS_RETRY_AFTER})
+            if action == "conflict":
+                return finish(409, {"error": "idempotency key reused with a different request body",
+                                    "request_id": request_id})
+            if action == "replay":
+                replay = dict(replay_entry["response"])
+                replay_headers = dict(replay.get("headers") or {})
+                replay_headers[REPLAY_HEADER] = "true"
+                return finish(replay["status"], body_text=replay["body"],
+                              extra_headers=replay_headers, replay=True)
 
         # 5. circuit breaker and upstream call with retries, then failover.
         # Fallback upstreams are considered only for GET requests or requests
@@ -308,52 +380,100 @@ class Gateway:
         status = TRANSPORT_ERROR
         rejected_state: Optional[str] = None
         called = False
-        for name in chain:
-            breaker = self.breakers.get(name)
-            if not breaker.allow(now):
-                if rejected_state is None:
-                    rejected_state = breaker.state
-                continue
-            attempt = 0
-            while attempt < self.retry_policy.max_attempts:
-                attempt += 1
-                attempts += 1
-                try:
-                    response = self.upstreams.call(name, request, route.timeout_ms)
-                    status = int(response["status"])
-                except UpstreamError:
-                    response = None
-                    status = TRANSPORT_ERROR
-                if not self.retry_policy.should_retry(attempt, status):
+        try:
+            for name in chain:
+                breaker = self.breakers.get(name)
+                if not breaker.allow(now):
+                    if rejected_state is None:
+                        rejected_state = breaker.state
+                    continue
+                attempt = 0
+                while attempt < self.retry_policy.max_attempts:
+                    attempt += 1
+                    attempts += 1
+                    try:
+                        response = self.upstreams.call(name, request, route.timeout_ms)
+                        status = int(response["status"])
+                    except UpstreamError:
+                        response = None
+                        status = TRANSPORT_ERROR
+                    if not self.retry_policy.should_retry(attempt, status):
+                        break
+                    if self.sleep_fn is not None:
+                        self.sleep_fn(self.retry_policy.delay_ms(attempt))
+                breaker.record(status != TRANSPORT_ERROR and status < 500, now)
+                if attempt:
+                    upstream_name = name
+                    called = True
+                if status != TRANSPORT_ERROR and status < 500:
                     break
-                if self.sleep_fn is not None:
-                    self.sleep_fn(self.retry_policy.delay_ms(attempt))
-            breaker.record(status != TRANSPORT_ERROR and status < 500, now)
-            if attempt:
-                upstream_name = name
-                called = True
-            if status != TRANSPORT_ERROR and status < 500:
-                break
-            # Transport error or 5xx after the retry budget: try the next upstream.
+                # Transport error or 5xx after the retry budget: try the next upstream.
 
-        if not called:
-            return finish(503, {"error": "upstream unavailable", "state": rejected_state,
-                                "request_id": request_id})
-        if status == TRANSPORT_ERROR:
-            return finish(502, {"error": "upstream error", "request_id": request_id,
-                                "upstream": upstream_name})
-        text = response["body"] if response else ""
-        if idem_key and status < 500:
-            self._remember(idem_key, body_hash, now, status, text)
-        return finish(status, body_text=text, extra_headers=response.get("headers") if response else None)
+            if not called:
+                # Every upstream refused through its breaker: no response to
+                # cache; the finally below frees the scope for a later request.
+                return finish(503, {"error": "upstream unavailable", "state": rejected_state,
+                                    "request_id": request_id})
+            if status == TRANSPORT_ERROR:
+                # A transport failure is the request's own result, never cached;
+                # the finally below lifts the protection for a later retry.
+                return finish(502, {"error": "upstream error", "request_id": request_id,
+                                    "upstream": upstream_name})
+            text = response["body"] if response else ""
+            if idem_scope is not None and status < 500:
+                # The marker becomes the cached response inside one critical
+                # section: a concurrent request can never observe the scope
+                # empty between the cache publish and the end of the in-flight
+                # state. The cache entry now owns the scope, so the finally
+                # release below is a no-op.
+                self._idem_publish(idem_scope, in_flight, body_hash, now, status, text)
+                in_flight = None
+            # A final 5xx keeps ``in_flight`` set, so the finally releases the
+            # scope without caching and a later request can attempt it again.
+            return finish(status, body_text=text,
+                          extra_headers=response.get("headers") if response else None)
+        finally:
+            # Runs on every exit that did not publish: breakers-only 503,
+            # transport 502, final 5xx, or even an unexpected exception, so an
+            # in-flight marker can never pin a scope after the chain ended.
+            self._idem_release(idem_scope, in_flight)
 
     # ---------------------------------------------------------------- helpers
-    def _remember(self, idem_key: str, body_hash: str, now: int, status: int, text: str) -> None:
-        if len(self._idempotency) > 1024:
-            self._idempotency = {k: v for k, v in self._idempotency.items() if v["expires_ms"] > now}
-        self._idempotency[idem_key] = {
-            "body_sha256": body_hash, "expires_ms": now + self.idempotency_window_ms,
-            "response": {"status": int(status), "body": text, "headers": {}}}
+    def _idem_publish(self, scope: Optional[_IdempotencyScope], marker: Optional[_InFlight],
+                      body_hash: str, now: int, status: int, text: str) -> None:
+        """Turn this request's in-flight marker into the cached response.
+
+        Runs in one critical section so there is no window in which the scope
+        looks free: a concurrent request either sees the marker (``425``/``409``)
+        or the finished cache entry (replay/``409``), never an opportunity to
+        run the upstream a second time.
+        """
+        if scope is None or marker is None:
+            return
+        with self._idem_lock:
+            if len(self._idempotency) > 1024:
+                live = {k: v for k, v in self._idempotency.items()
+                        if isinstance(v, _InFlight) or v["expires_ms"] > now}
+                self._idempotency.clear()
+                self._idempotency.update(live)
+            self._idempotency[scope] = {
+                "body_sha256": body_hash, "expires_ms": now + self.idempotency_window_ms,
+                "response": {"status": int(status), "body": text, "headers": {}}}
+
+    def _idem_release(self, scope: Optional[_IdempotencyScope],
+                      marker: Optional[_InFlight]) -> None:
+        """Drop the in-flight marker after a 5xx, transport failure or a chain
+        refused entirely by breakers, so the scope can be executed again.
+
+        Only this request's own marker is removed: it is never overwritten by
+        another request (concurrent callers get ``425``/``409`` instead of
+        taking over), so guarding the identity costs nothing in practice.
+        """
+        if scope is None or marker is None:
+            return
+        with self._idem_lock:
+            if self._idempotency.get(scope) is marker:
+                self._idempotency.pop(scope, None)
 
     def _resolve_key(self, hdrs: Dict[str, str],
                      now_ms: int) -> Tuple[Optional[ApiKey], Optional[str]]:
