@@ -80,14 +80,16 @@ tests; only the HTTP front end reads the wall clock.
    and it is compared in constant time.
 5. **Quota.** A route names one policy (`quota_policy`, the historical form) or
    an ordered, non-empty list (`quota_policies`, joint admission). Each named
-   policy charges one unit against the partition resolved for that policy (see
-   below). For a joint check, partition identities are verified in declaration
-   order and the first failure decides the response; the buckets themselves are
-   admitted as a group — either every policy pays one unit or none does. A
+   policy charges the route's `quota_cost` units (default 1) against the
+   partition resolved for that policy (see below). For a joint check, partition
+   identities are verified in declaration order and the first failure decides
+   the response; the buckets themselves are admitted as a group — either every
+   policy pays the full cost or none does. A
    rejected request gets `429` with `policy_id` (the first policy in declaration
    order that was short), `reset_at_ms` (the latest recovery time among the
    short policies) and a `Retry-After` header, and the *rejected attempt is
-   still written to the ledger* (one entry per named policy). Identity
+   still written to the ledger* (one entry per named policy, each carrying the
+   full `quota_cost`). Identity
    rejections raised while resolving a partition (`400`/`401`/`403`) consume no
    quota, write no usage and never call the upstream, but are still audited.
 6. **Idempotency.** See below; a replay short circuits the rest of the pipeline,
@@ -109,8 +111,11 @@ tests; only the HTTP front end reads the wall clock.
 9. **Audit.** One JSON line per request is appended to `<data-dir>/audit.jsonl`
    with `at`, `request_id`, `tenant`, `key_id`, `route_id`, `upstream`, `status`,
    `latency_ms`, `attempts`, `quota{policy_id,allowed,remaining}` and
-   `idempotent_replay`. A `quota_policies` route additionally carries `quotas`,
-   an ordered list of `{policy_id, allowed, remaining}` in declaration order; the
+   `idempotent_replay`. When the quota check actually ran, the `quota` block
+   also carries the charged `cost`. A `quota_policies` route additionally
+   carries `quotas`,
+   an ordered list of `{policy_id, allowed, remaining, cost}` in declaration
+   order; the
    legacy `quota` block equals its first entry. `quotas` is `[]` (and `quota`
    keeps its unchecked value) when such a request never reached the joint check.
 
@@ -374,7 +379,8 @@ usage and call no upstream.
 
 Once identities are resolved, the named buckets are admitted as a group under
 one lock: every bucket is probed without mutating state, and the request
-proceeds only when **all** policies have room, in which case each pays one unit.
+proceeds only when **all** policies have room, in which case each pays the
+route's `quota_cost`.
 If any policy is short, none pays — a concurrent group in the same partitions
 can neither partially charge nor exceed a limit, and all three algorithms and
 partition modes compose. On rejection the response is `429` with `policy_id`
@@ -383,10 +389,11 @@ recovery time across all short policies, and the usual `Retry-After`
 conversion.
 
 One joint check writes one usage record per named policy in the existing format,
-each with `cost: 1`; every record's `allowed` is the whole group's verdict, so
+each with `cost` equal to the route's `quota_cost`; every record's `allowed` is
+the whole group's verdict, so
 `requests` counts records while `allowed_cost` counts only admitted groups.
 Audit stays one line per request: a joint route adds `quotas` (ordered
-`{policy_id, allowed, remaining}`, with `quota` equal to its first item); on
+`{policy_id, allowed, remaining, cost}`, with `quota` equal to its first item); on
 rejection `remaining` is the un deducted available balance, and when the request
 never reached the joint check `quotas` is `[]` and `quota` keeps its unchecked
 value. Idempotent replays and conflicts still check quota first, and retries,
@@ -395,6 +402,38 @@ changes a route's policy combination keeps quota buckets, breaker state and the
 idempotency cache; in-flight requests keep the combination they started with,
 and an invalid reload keeps the previous configuration, state and health
 feedback through the usual `ready` / `last_error` channel.
+
+## Route quota cost
+
+A route may set `quota_cost`: a fixed number of quota units one request pays
+against **each** policy it names, letting an endpoint consume several units of
+budget by business weight. It is optional and defaults to `1`, which preserves
+the historical behaviour exactly. The value is the quota charge only — it is
+not an upstream attempt count, so retries and fallback upstreams never charge
+it again.
+
+Only a non-boolean positive integer is accepted: `null`, a boolean, any other
+type, or a value below `1` fails config loading, `route-add` and hot reload
+alike with `GatewayError("... quota_cost must be a positive integer")`. A
+rejected batch add writes none of its routes and leaves the revision unchanged;
+an invalid reload keeps the previous configuration, quota buckets, breaker
+state and idempotency cache, reported through the usual
+`reloaded: false, ready: false, error` feedback. `GET /v1/config` echoes
+`quota_cost` on every route — `1` for documents that omit it.
+
+`Gateway.handle` and the HTTP proxy apply the same semantics: once the identity
+checks pass, the full cost feeds the single-policy check or the joint
+all-or-nothing admission, and all three algorithms derive `remaining`,
+`reset_at_ms` and `Retry-After` from it. Each request that enters the quota
+check writes one usage record per named policy with `cost` equal to
+`quota_cost`, for allowed and rejected attempts alike, and the audit `quota`
+(and a joint route's `quotas`) entries carry the same `cost`. Routes without a
+quota policy record nothing, and authentication, identity and version
+rejections never reach the quota step. Idempotent replays re-check and pay the
+cost again; idempotency conflicts are charged only because they pass the quota
+check first. A valid hot reload that changes only the cost applies to new
+requests, resets no buckets, breakers or idempotency entries, and in-flight
+requests keep the cost they started with.
 
 ## Configuration
 
@@ -433,7 +472,9 @@ satisfies any requirement. `tenant: "*"` marks a route shared by every tenant.
 `enabled` defaults to `true` and `expires_at_ms` to `null` (see
 [Key disabling and expiry](#key-disabling-and-expiry)).
 `partition_by` defaults to `"policy"` and accepts only `"policy"`, `"tenant"`
-and `"key"` (see [Quota partitions](#quota-partitions)). `fallback_upstreams`
+and `"key"` (see [Quota partitions](#quota-partitions)). `quota_cost` defaults
+to `1` and accepts only a non-boolean positive integer (see
+[Route quota cost](#route-quota-cost)). `fallback_upstreams`
 defaults to `[]` and lists the ordered failover upstreams (see
 [Fallback upstreams](#fallback-upstreams)). `version` is optional; when present
 it must be a non-empty string and it opts the route into API version filtering
@@ -441,7 +482,8 @@ it must be a non-empty string and it opts the route into API version filtering
 echoes `version` only on routes that declared it. `load()` rejects
 malformed documents with `GatewayError` (unknown algorithm, an invalid
 `partition_by`, an invalid `fallback_upstreams`, a non-boolean `enabled`, an
-invalid `expires_at_ms`, a `version` that is null, empty or not a string,
+invalid `expires_at_ms`, a `version` that is null, empty or not a string, a
+`quota_cost` that is null, a boolean, a non-integer or below 1,
 non-positive
 `limit`/`window_ms`/`burst`/`weight`,
 `path_prefix` without a leading `/`, malformed `secret_sha256`, duplicate ids, a

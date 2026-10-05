@@ -274,6 +274,9 @@ class Gateway:
         policy_ids = route.quota_policies if joint else (
             [route.quota_policy] if route.quota_policy else [])
         if policy_ids:
+            # The route's fixed cost is charged once per request against every
+            # named policy; retries and fallback upstreams never charge again.
+            cost = route.quota_cost
             # Resolve every named policy's partition identity in declaration
             # order. The first identity failure decides the response; it neither
             # consumes quota, writes usage nor calls the upstream, exactly as for
@@ -310,20 +313,20 @@ class Gateway:
                 return finish(error_status,
                               {"error": error_message, "request_id": request_id})
             if joint:
-                results = self.limiter.allow_group(checks, 1, now)
+                results = self.limiter.allow_group(checks, cost, now)
             else:
                 only_id, only_partition = checks[0]
-                results = [self.limiter.allow(only_id, 1, now, partition=only_partition)]
+                results = [self.limiter.allow(only_id, cost, now, partition=only_partition)]
             # ``allowed`` always reflects the whole group: a usage record is
             # written per policy, but the request is admitted only when every
             # policy had room.
             group_allowed = all(result["allowed"] for result in results)
             quotas = [{"policy_id": result["policy_id"], "allowed": group_allowed,
-                       "remaining": result["remaining"]} for result in results]
+                       "remaining": result["remaining"], "cost": cost} for result in results]
             quota = dict(quotas[0])
             for result in results:
                 self.ledger.record(tenant, result["policy_id"],
-                                   key.key_id if key else None, 1, group_allowed, now)
+                                   key.key_id if key else None, cost, group_allowed, now)
             if not group_allowed:
                 insufficient = [result for result in results if not result["allowed"]]
                 first_short = next(result for result in results if not result["allowed"])

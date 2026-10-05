@@ -97,6 +97,18 @@ def _quota_policy_list(data: Dict[str, Any], key: str, where: str) -> Optional[L
     return out
 
 
+def _quota_cost_value(data: Dict[str, Any], where: str) -> int:
+    """Optional fixed quota cost: omitted means one unit per request; when
+    present it must be a positive integer -- null, a boolean, any other type
+    or a value below 1 is rejected."""
+    if "quota_cost" not in data:
+        return 1
+    raw = data["quota_cost"]
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        raise GatewayError("%s: quota_cost must be a positive integer" % where)
+    return raw
+
+
 def _version_value(data: Dict[str, Any], where: str) -> Optional[str]:
     """Optional API version: omitted means an unversioned (legacy) route; when
     present it must be a non-empty string -- null, an empty string or any other
@@ -132,6 +144,7 @@ class Route:
     response_headers: Dict[str, str] = field(default_factory=dict)
     quota_policy: Optional[str] = None
     quota_policies: Optional[List[str]] = None
+    quota_cost: int = 1
     timeout_ms: int = 5000
     scopes: List[str] = field(default_factory=list)
     fallback_upstreams: List[str] = field(default_factory=list)
@@ -168,6 +181,7 @@ class Route:
                    response_headers=_str_map(transform, "response_headers", "%s transform" % where),
                    quota_policy=quota_policy,
                    quota_policies=quota_policies,
+                   quota_cost=_quota_cost_value(data, where),
                    timeout_ms=timeout_ms, scopes=_str_list(data, "scopes", where),
                    fallback_upstreams=_fallback_list(data, "fallback_upstreams", where, upstream),
                    version=_version_value(data, where))
@@ -177,6 +191,7 @@ class Route:
                "match": {"method": self.method, "path_prefix": self.path_prefix},
                "upstream": self.upstream, "auth_required": self.auth_required,
                "weight": self.weight, "quota_policy": self.quota_policy,
+               "quota_cost": self.quota_cost,
                "timeout_ms": self.timeout_ms, "scopes": list(self.scopes),
                "fallback_upstreams": list(self.fallback_upstreams),
                "transform": {"request_headers": dict(self.request_headers),

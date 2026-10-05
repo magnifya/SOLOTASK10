@@ -228,7 +228,8 @@ class ConcurrentIdempotencyTest(unittest.TestCase):
             self.assertEqual((entry["status"], entry["attempts"], entry["idempotent_replay"]),
                              (425, 0, False))
             self.assertEqual(entry["quota"], {"policy_id": "p-slide", "allowed": True,
-                                              "remaining": expected_remaining[request_id]})
+                                              "remaining": expected_remaining[request_id],
+                                              "cost": 1})
             self.assertEqual(entry["route_id"], "r-block")
         self.block.release.set()
         thread.join(5)
@@ -248,8 +249,8 @@ class ConcurrentIdempotencyTest(unittest.TestCase):
         self.assertEqual(entry["attempts"], 0)
         self.assertEqual(entry["quota"]["policy_id"], "p-j1")
         self.assertEqual(entry["quotas"], [
-            {"policy_id": "p-j1", "allowed": False, "remaining": 0},
-            {"policy_id": "p-j2", "allowed": False, "remaining": 4}])
+            {"policy_id": "p-j1", "allowed": False, "remaining": 0, "cost": 1},
+            {"policy_id": "p-j2", "allowed": False, "remaining": 4, "cost": 1}])
         # One usage record per named policy per request.
         self.assertEqual(self.gateway.usage("acme")["requests"], 4)
         # After the bucket refills *and* the finished response window has
