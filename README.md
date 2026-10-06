@@ -109,7 +109,9 @@ tests; only the HTTP front end reads the wall clock.
 8. **Transforms.** `transform.request_headers` are added to the upstream call,
    `transform.response_headers` are added to the reply. Credential headers
    (`Authorization`, `X-Api-Key`) and hop-by-hop headers are stripped before the
-   upstream call.
+   upstream call. `transform.request_body` / `transform.response_body`
+   optionally wrap or unwrap the JSON bodies (see
+   [JSON body transforms](#json-body-transforms)).
 9. **Audit.** One JSON line per request is appended to `<data-dir>/audit.jsonl`
    with `at`, `request_id`, `tenant`, `key_id`, `route_id`, `upstream`, `status`,
    `latency_ms`, `attempts`, `quota{policy_id,allowed,remaining,cost}` and
@@ -240,6 +242,48 @@ in-flight requests keep the order they started with — and editing
 `fallback_upstreams` resets neither quota buckets nor breaker state. An
 invalid reload keeps the last valid configuration, the quota buckets, the
 breaker states and the existing health feedback.
+
+## JSON body transforms
+
+A route's `transform` may additionally declare `request_body` and/or
+`response_body`, letting one route wrap or unwrap JSON payloads between the
+client format and the upstream format. Each entry must be an object with
+exactly two keys: `operation` (`"wrap"` or `"unwrap"`) and `field` (a non-empty
+string). Omitting either entry (including in documents written before the
+fields existed) leaves that direction untouched. The entries are validated
+like every other config field — `null`, a non-object, extra keys, a missing or
+unknown `operation`, or a missing, empty or non-string `field` all fail with a
+`GatewayError` at config load, in `route-add` and on hot reload; a rejected
+batch add or reload changes neither the configuration, the revision, quota
+buckets, breaker states nor the idempotency state. `GET /v1/config` echoes
+each entry only on routes that declared it.
+
+The **request** transform runs after authentication, partition identity
+resolution and the quota check, and before idempotency admission:
+
+* `wrap` parses the body as UTF-8 JSON and places the resulting value — any
+  JSON value — under `field` in a new top-level object;
+* `unwrap` requires a top-level JSON object holding `field` and sends the
+  field's value as the new request body;
+* an empty body, invalid JSON, or an unwrap target that is not an object or
+  lacks the field is rejected with `400` and
+  `{"error": "invalid request body", "request_id": ...}` — the request never
+  calls an upstream, never occupies or writes the idempotency cache, is still
+  billed exactly once at the quota step, and audits with `attempts: 0`.
+
+The idempotency body hash always covers the **original** client body, and the
+transformed body is what every retry and every failover upstream receives.
+
+The **response** transform runs once, on the final response of the whole
+retry/failover chain, and only when its status is below `500`: the body is
+parsed and wrapped or unwrapped by the same rules, the status is kept and the
+output is JSON. A final response that is not valid JSON, or an unwrap target
+that is not an object or lacks the field, becomes `502` with
+`{"error": "invalid upstream response body", "request_id": ...}`; the audit
+entry keeps the real `attempts` and nothing is cached. Final `5xx` responses,
+transport failures and routes without a response transform keep the existing
+behaviour. The idempotency cache stores the **transformed** client response,
+so a replay returns it without calling any upstream.
 
 ## Key disabling and expiry
 
@@ -493,7 +537,9 @@ it must be a non-empty string and it opts the route into API version filtering
 (see [Request pipeline](#request-pipeline)) — the sanitized `GET /v1/config`
 echoes `version` only on routes that declared it. `quota_cost` is optional,
 defaults to `1` and is echoed on every route (see
-[Fixed quota cost](#fixed-quota-cost)). `load()` rejects
+[Fixed quota cost](#fixed-quota-cost)). `transform.request_body` and
+`transform.response_body` are optional and echoed only when declared (see
+[JSON body transforms](#json-body-transforms)). `load()` rejects
 malformed documents with `GatewayError` (unknown algorithm, an invalid
 `partition_by`, an invalid `fallback_upstreams`, a non-boolean `enabled`, an
 invalid `expires_at_ms`, a `version` that is null, empty or not a string,
@@ -504,7 +550,9 @@ a `quota_cost` that is null, boolean, not an integer or below 1
 `path_prefix` without a leading `/`, malformed `secret_sha256`, duplicate ids, a
 route naming an unknown quota policy, or a malformed `quota_policies` — `null`,
 empty, non-array, non-string/empty entries, duplicates or both `quota_policy`
-and `quota_policies` set). `reload_if_changed()` re-reads the file
+and `quota_policies` set — or a malformed `request_body`/`response_body` —
+`null`, a non-object, extra keys, or a missing/invalid `operation` or
+`field`). `reload_if_changed()` re-reads the file
 only when its mtime moved and keeps `ready` true only when the new document is
 valid; an invalid reload keeps the last known good config, sets `ready = false`
 and records `last_error`.
@@ -524,7 +572,7 @@ are unauthenticated in this skeleton - front them with your own auth in producti
 | GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | `400` non-integer `since` |
 | GET | `/v1/audit?tenant=&limit=` | `200 {"tenant","count","entries"}` | `400` non-integer `limit` |
 | POST | `/v1/breaker/reset` | `200 {"reset":["upstream",...]}` | `400` bad JSON |
-| * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition), `401` missing/unknown/disabled/expired key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict (finished or in-flight response with a different body), `425` same idempotency scope still in progress with the same body, `429` quota exceeded, `502` upstream error, `503` breaker open |
+| * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition) or invalid request body, `401` missing/unknown/disabled/expired key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict (finished or in-flight response with a different body), `425` same idempotency scope still in progress with the same body, `429` quota exceeded, `502` upstream error or invalid upstream response body, `503` breaker open |
 
 A `/gw/{path}` prefix on the proxy surface is stripped before matching upstreams,
 so `/gw/api/items` is matched as `/api/items`.

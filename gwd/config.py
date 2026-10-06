@@ -111,6 +111,30 @@ def _quota_cost(data: Dict[str, Any], where: str) -> int:
     return int(raw)
 
 
+BODY_OPERATIONS = ("wrap", "unwrap")
+
+
+def _body_transform(data: Dict[str, Any], key: str, where: str) -> Optional[Dict[str, str]]:
+    """Optional JSON body transform: omitted means the body passes through
+    unchanged; when present (even null) it must be an object with exactly
+    ``operation`` (``wrap`` or ``unwrap``) and ``field`` (a non-empty string)."""
+    if key not in data:
+        return None
+    raw = data[key]
+    if not isinstance(raw, dict):
+        raise GatewayError("%s: %r must be an object with operation and field" % (where, key))
+    if set(raw) - {"operation", "field"}:
+        raise GatewayError("%s: %r allows only operation and field" % (where, key))
+    operation = raw.get("operation")
+    if operation not in BODY_OPERATIONS:
+        raise GatewayError("%s: %r operation must be one of %s"
+                           % (where, key, ", ".join(BODY_OPERATIONS)))
+    field_name = raw.get("field")
+    if not isinstance(field_name, str) or not field_name:
+        raise GatewayError("%s: %r field must be a non-empty string" % (where, key))
+    return {"operation": operation, "field": field_name}
+
+
 def _version_value(data: Dict[str, Any], where: str) -> Optional[str]:
     """Optional API version: omitted means an unversioned (legacy) route; when
     present it must be a non-empty string -- null, an empty string or any other
@@ -151,6 +175,8 @@ class Route:
     scopes: List[str] = field(default_factory=list)
     fallback_upstreams: List[str] = field(default_factory=list)
     version: Optional[str] = None
+    request_body: Optional[Dict[str, str]] = None
+    response_body: Optional[Dict[str, str]] = None
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "route") -> "Route":
@@ -187,7 +213,10 @@ class Route:
                    quota_cost=quota_cost,
                    timeout_ms=timeout_ms, scopes=_str_list(data, "scopes", where),
                    fallback_upstreams=_fallback_list(data, "fallback_upstreams", where, upstream),
-                   version=_version_value(data, where))
+                   version=_version_value(data, where),
+                   request_body=_body_transform(transform, "request_body", "%s transform" % where),
+                   response_body=_body_transform(transform, "response_body",
+                                                 "%s transform" % where))
 
     def to_dict(self) -> Dict[str, Any]:
         out = {"id": self.id, "tenant": self.tenant,
@@ -199,6 +228,12 @@ class Route:
                "fallback_upstreams": list(self.fallback_upstreams),
                "transform": {"request_headers": dict(self.request_headers),
                              "response_headers": dict(self.response_headers)}}
+        # Body transforms echo only when declared, so routes written before the
+        # fields existed keep their exact output.
+        if self.request_body is not None:
+            out["transform"]["request_body"] = dict(self.request_body)
+        if self.response_body is not None:
+            out["transform"]["response_body"] = dict(self.response_body)
         if self.quota_policies is not None:
             out["quota_policies"] = list(self.quota_policies)
         if self.version is not None:

@@ -53,6 +53,26 @@ def _parse_traceparent(value: str) -> Optional[Tuple[str, str, str]]:
     return trace_id, parent_id, flags
 
 
+def _apply_body_transform(spec: Dict[str, str], text: str) -> Optional[str]:
+    """Run one wrap/unwrap body transform, returning the new body text.
+
+    ``wrap`` places any parsed JSON value under ``field`` in a new top-level
+    object; ``unwrap`` requires a top-level object holding ``field`` and takes
+    its value as the new body. An unparseable body, or an unwrap target that
+    is not an object or lacks the field, returns ``None`` so the caller can
+    map it to its rejection status.
+    """
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    if spec["operation"] == "wrap":
+        return json.dumps({spec["field"]: value}, sort_keys=True)
+    if not isinstance(value, dict) or spec["field"] not in value:
+        return None
+    return json.dumps(value[spec["field"]], sort_keys=True)
+
+
 class _IdempotencyScope(tuple):
     """The concurrent identity of an idempotent request: tenant plus the full
     key value.
@@ -414,6 +434,18 @@ class Gateway:
                                     "reset_at_ms": reset_at_ms},
                               extra_headers={"Retry-After": str(retry_after)})
 
+        # 3.5 request body transform. Runs after authentication, partition
+        # identity and quota but before idempotency admission, so a rejection
+        # never occupies an idempotency scope, never calls an upstream and is
+        # still billed exactly once; the idempotency hash below keeps covering
+        # the original client body, not the transformed one.
+        upstream_body = body
+        if route.request_body is not None:
+            upstream_body = _apply_body_transform(route.request_body, body)
+            if upstream_body is None:
+                return finish(400, {"error": "invalid request body",
+                                    "request_id": request_id})
+
         # 4. idempotency
         body_hash = sha256_hex(body)
         idem_scope: Optional[_IdempotencyScope] = None
@@ -485,7 +517,7 @@ class Gateway:
         if "tracestate" in hdrs:
             # tracestate is forwarded verbatim and never feeds routing or quota.
             upstream_headers["tracestate"] = hdrs["tracestate"]
-        request = {"method": method, "path": path, "body": body, "tenant": tenant,
+        request = {"method": method, "path": path, "body": upstream_body, "tenant": tenant,
                    "request_id": request_id, "headers": upstream_headers}
         response = None
         status = TRANSPORT_ERROR
@@ -531,6 +563,16 @@ class Gateway:
                 return finish(502, {"error": "upstream error", "request_id": request_id,
                                     "upstream": upstream_name})
             text = response["body"] if response else ""
+            if route.response_body is not None and status < 500:
+                # The response transform runs once, on the final response of
+                # the whole chain. A body that cannot be transformed is a 502
+                # and is never cached: ``in_flight`` stays set, so the finally
+                # below frees the scope for a later attempt.
+                transformed = _apply_body_transform(route.response_body, text)
+                if transformed is None:
+                    return finish(502, {"error": "invalid upstream response body",
+                                        "request_id": request_id})
+                text = transformed
             if idem_scope is not None and status < 500:
                 # The marker becomes the cached response inside one critical
                 # section: a concurrent request can never observe the scope
