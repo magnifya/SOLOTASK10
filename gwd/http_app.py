@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from .config import GatewayError
 from .gateway import Gateway
+from .limits import parse_audit_filters
 
 ADMIN_GET = ("/healthz", "/v1/config", "/v1/quota/usage", "/v1/audit")
 ADMIN_POST = ("/v1/config/reload", "/v1/keys", "/v1/quota/policies", "/v1/breaker/reset")
@@ -65,7 +66,10 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if handled:
                 return
         except GatewayError as exc:
-            self._json(exc.status, {"error": exc.message, "request_id": request_id}, request_id)
+            payload: Dict[str, Any] = {"error": exc.message, "request_id": request_id}
+            if exc.parameter is not None:
+                payload["parameter"] = exc.parameter
+            self._json(exc.status, payload, request_id)
             return
         except ValueError as exc:
             self._json(400, {"error": str(exc), "request_id": request_id}, request_id)
@@ -115,7 +119,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
         elif target == "/v1/audit":
             tenant = _first(params, "tenant") or ""
             limit = _int_or_none(_first(params, "limit"))
-            entries = gateway.audit(tenant, 50 if limit is None else limit)
+            filters = parse_audit_filters(
+                request_id=_first(params, "request_id"),
+                trace_id=_first(params, "trace_id"),
+                route_id=_first(params, "route_id"),
+                status=_first(params, "status"),
+                since=_first(params, "since"),
+                until=_first(params, "until"))
+            entries = gateway.audit(tenant, 50 if limit is None else limit, **filters)
             self._json(200, {"tenant": tenant, "count": len(entries), "entries": entries}, request_id)
         elif target == "/v1/breaker/reset":
             payload = _json_body(raw, default={})

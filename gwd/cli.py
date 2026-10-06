@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from .config import ANY_SCOPE, GatewayError
 from .gateway import Gateway
 from .http_app import create_server
-from .limits import AuditLog, QuotaLedger
+from .limits import AuditLog, QuotaLedger, parse_audit_filters
 
 
 def _out(payload: Any) -> None:
@@ -122,7 +122,10 @@ def cmd_usage(args: argparse.Namespace) -> Dict[str, Any]:
 
 
 def cmd_audit(args: argparse.Namespace) -> Dict[str, Any]:
-    entries = AuditLog(args.data_dir).entries(args.tenant or None, args.limit)
+    filters = parse_audit_filters(request_id=args.request_id, trace_id=args.trace_id,
+                                  route_id=args.route_id, status=args.status,
+                                  since=args.since, until=args.until)
+    entries = AuditLog(args.data_dir).entries(args.tenant or None, args.limit, **filters)
     return {"tenant": args.tenant, "count": len(entries), "entries": entries}
 
 
@@ -181,6 +184,15 @@ def build_parser() -> argparse.ArgumentParser:
     audit = sub.add_parser("audit", help="read the local audit trail")
     audit.add_argument("--tenant", default="")
     audit.add_argument("--limit", type=int, default=50)
+    audit.add_argument("--request-id", default=None, help="exact request_id match")
+    audit.add_argument("--trace-id", default=None,
+                       help="exact trace_id match (32 lowercase hex digits)")
+    audit.add_argument("--route-id", default=None, help="exact route_id match")
+    audit.add_argument("--status", default=None, help="exact status match (100-599)")
+    audit.add_argument("--since", default=None,
+                       help="inclusive lower bound on the entry timestamp in ms")
+    audit.add_argument("--until", default=None,
+                       help="exclusive upper bound on the entry timestamp in ms")
     audit.set_defaults(func=cmd_audit)
     return parser
 

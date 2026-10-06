@@ -18,12 +18,18 @@ EMPTY_CONFIG: Dict[str, Any] = {"routes": [], "keys": [], "quota_policies": []}
 
 
 class GatewayError(Exception):
-    """A rejected configuration or request; ``status`` is the HTTP status to use."""
+    """A rejected configuration or request; ``status`` is the HTTP status to use.
 
-    def __init__(self, message: str, status: int = 400) -> None:
+    ``parameter`` optionally names the offending query parameter, so the HTTP
+    surface can point the caller at the exact input that failed validation.
+    """
+
+    def __init__(self, message: str, status: int = 400,
+                 parameter: Optional[str] = None) -> None:
         super().__init__(message)
         self.message = str(message)
         self.status = int(status)
+        self.parameter = parameter
 
 
 def sha256_hex(text: str) -> str:

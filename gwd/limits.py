@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import threading
 from collections import deque
 from typing import Any, Deque, Dict, Iterable, List, Optional
@@ -345,10 +346,102 @@ class AuditLog:
         return entry
 
     def entries(self, tenant: Optional[str] = None,
-                limit: Optional[int] = None) -> List[Dict[str, Any]]:
+                limit: Optional[int] = None,
+                request_id: Optional[str] = None,
+                trace_id: Optional[str] = None,
+                route_id: Optional[str] = None,
+                status: Optional[int] = None,
+                since_ms: Optional[int] = None,
+                until_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Read the trail, keeping only rows that satisfy every given filter.
+
+        All conditions are conjunctive and compared against the stored value as
+        is; a row that lacks a filtered field never matches. ``since_ms`` is
+        inclusive, ``until_ms`` exclusive, both compared against the row's
+        ``at``. Rows keep their append order and ``limit`` keeps only the last
+        matching ones. Reading never writes to any file.
+        """
         rows = _read_jsonl(self.path)
         if tenant:
             rows = [r for r in rows if r.get("tenant") == tenant]
+        if request_id is not None:
+            rows = [r for r in rows if r.get("request_id") == request_id]
+        if trace_id is not None:
+            rows = [r for r in rows if r.get("trace_id") == trace_id]
+        if route_id is not None:
+            rows = [r for r in rows if r.get("route_id") == route_id]
+        if status is not None:
+            rows = [r for r in rows if r.get("status") == status]
+        if since_ms is not None:
+            rows = [r for r in rows
+                    if _row_at(r) is not None and _row_at(r) >= since_ms]
+        if until_ms is not None:
+            rows = [r for r in rows
+                    if _row_at(r) is not None and _row_at(r) < until_ms]
         if limit is not None and int(limit) > 0:
             rows = rows[-int(limit):]
         return rows
+
+
+#: A W3C trace id is exactly 32 lowercase hexadecimal digits.
+_TRACE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+#: A status filter is a plain decimal integer; the range is checked separately.
+_STATUS_RE = re.compile(r"^[0-9]+$")
+
+
+def _row_at(row: Dict[str, Any]) -> Optional[int]:
+    """The row's ``at`` as an integer, or ``None`` when absent or not numeric."""
+    try:
+        return int(row.get("at"))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_audit_filters(request_id: Any = None, trace_id: Any = None,
+                        route_id: Any = None, status: Any = None,
+                        since: Any = None, until: Any = None) -> Dict[str, Any]:
+    """Validate raw audit query values into kwargs for :meth:`AuditLog.entries`.
+
+    Every ``None`` input is simply absent from the result. Anything else must
+    be well formed: ``trace_id`` is exactly 32 lowercase hex digits, ``status``
+    a decimal integer in [100, 599], ``since``/``until`` integer millisecond
+    timestamps with ``until`` not earlier than ``since``. An invalid value is
+    rejected with ``GatewayError("invalid audit query", 400, parameter=...)``
+    naming the offending parameter -- it is never silently treated as absent.
+    """
+    filters: Dict[str, Any] = {}
+    if request_id is not None:
+        filters["request_id"] = str(request_id)
+    if trace_id is not None:
+        if not _TRACE_ID_RE.match(str(trace_id)):
+            raise GatewayError("invalid audit query", 400, parameter="trace_id")
+        filters["trace_id"] = str(trace_id)
+    if route_id is not None:
+        filters["route_id"] = str(route_id)
+    if status is not None:
+        text = str(status).strip()
+        if not _STATUS_RE.match(text):
+            raise GatewayError("invalid audit query", 400, parameter="status")
+        code = int(text)
+        if code < 100 or code > 599:
+            raise GatewayError("invalid audit query", 400, parameter="status")
+        filters["status"] = code
+    since_ms = _audit_ms(since, "since")
+    until_ms = _audit_ms(until, "until")
+    if since_ms is not None and until_ms is not None and until_ms < since_ms:
+        raise GatewayError("invalid audit query", 400, parameter="until")
+    if since_ms is not None:
+        filters["since_ms"] = since_ms
+    if until_ms is not None:
+        filters["until_ms"] = until_ms
+    return filters
+
+
+def _audit_ms(value: Any, parameter: str) -> Optional[int]:
+    """Parse a millisecond timestamp filter like the existing integer params."""
+    if value is None:
+        return None
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        raise GatewayError("invalid audit query", 400, parameter=parameter)

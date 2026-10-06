@@ -153,8 +153,12 @@ class Gateway:
     def usage(self, tenant: str = "", since_ms: Optional[int] = None) -> Dict[str, Any]:
         return self.ledger.usage(tenant or None, since_ms)
 
-    def audit(self, tenant: str = "", limit: int = 50) -> List[Dict[str, Any]]:
-        return self.audit_log.entries(tenant or None, limit)
+    def audit(self, tenant: str = "", limit: int = 50, **filters: Any) -> List[Dict[str, Any]]:
+        """Read the audit trail; ``filters`` are validated ``AuditLog.entries``
+        kwargs (``request_id``, ``trace_id``, ``route_id``, ``status``,
+        ``since_ms``, ``until_ms``). The query is read-only: it never reloads
+        config, clears state or calls an upstream."""
+        return self.audit_log.entries(tenant or None, limit, **filters)
 
     def breaker_reset(self, name: Optional[str] = None) -> List[str]:
         return self.breakers.reset(name)

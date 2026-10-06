@@ -41,7 +41,7 @@ directly, so they work without a running server.
 | `quota-set --file <json>` | append a quota policy (or array) |
 | `call --method --path --tenant --key --idempotency-key` | call a running gateway through the proxy surface |
 | `usage --tenant [--since]` | aggregate the local `usage.jsonl` ledger |
-| `audit --tenant [--limit]` | read the local `audit.jsonl` trail |
+| `audit --tenant [--limit] [--request-id] [--trace-id] [--route-id] [--status] [--since] [--until]` | read the local `audit.jsonl` trail |
 
 Every command prints a single line of JSON on stdout, and on failure prints a
 single line of JSON on stderr and exits non-zero.
@@ -627,12 +627,26 @@ are unauthenticated in this skeleton - front them with your own auth in producti
 | POST | `/v1/keys/{key_id}/rotate` | `200` same fields as `POST /v1/keys` with the new `secret` (returned once) | `400` empty key id / non-object or malformed body, `404` unknown key id |
 | POST | `/v1/quota/policies` | `201` policy object (echoes `partition_by`) | `400` invalid policy / `partition_by`, `409` duplicate id |
 | GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | `400` non-integer `since` |
-| GET | `/v1/audit?tenant=&limit=` | `200 {"tenant","count","entries"}` | `400` non-integer `limit` |
+| GET | `/v1/audit?tenant=&limit=&request_id=&trace_id=&route_id=&status=&since=&until=` | `200 {"tenant","count","entries"}` | `400 {"error":"invalid audit query","parameter",...}` for a malformed `trace_id` (not 32 lowercase hex), `status` (not a 100-599 decimal integer), non-integer `since`/`until` or `until` earlier than `since`; `400` non-integer `limit` |
 | POST | `/v1/breaker/reset` | `200 {"reset":["upstream",...]}` | `400` bad JSON |
 | * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition), `401` missing/unknown/disabled/expired key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict (finished or in-flight response with a different body), `425` same idempotency scope still in progress with the same body, `429` quota exceeded, `502` upstream error, `503` breaker open |
 
 A `/gw/{path}` prefix on the proxy surface is stripped before matching upstreams,
 so `/gw/api/items` is matched as `/api/items`.
+
+### Audit queries
+
+`GET /v1/audit` and `gwd audit` accept the same optional filters: `request_id`,
+`trace_id`, `route_id`, `status`, `since` and `until`, in addition to `tenant`
+and `limit`. All given conditions must hold at once; string conditions compare
+the stored value exactly and a historical record that lacks a filtered field
+never matches. `trace_id` must be 32 lowercase hex digits, `status` a decimal
+integer in [100, 599], `since` an inclusive and `until` an exclusive
+millisecond bound on the record's `at` (`until` earlier than `since` is
+rejected). Matching records keep their append order and `limit` keeps only the
+last ones; an empty result is still `200` with `count: 0`. Querying is
+read-only: it never writes the audit or usage files, reloads the config,
+clears state or calls an upstream.
 
 ## Upstreams
 
