@@ -153,8 +153,17 @@ class Gateway:
     def usage(self, tenant: str = "", since_ms: Optional[int] = None) -> Dict[str, Any]:
         return self.ledger.usage(tenant or None, since_ms)
 
-    def audit(self, tenant: str = "", limit: int = 50) -> List[Dict[str, Any]]:
-        return self.audit_log.entries(tenant or None, limit)
+    def audit(self, tenant: str = "", limit: int = 50,
+              request_id: Optional[str] = None, trace_id: Optional[str] = None,
+              route_id: Optional[str] = None, status: Optional[int] = None,
+              since_ms: Optional[int] = None,
+              until_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Read the audit trail; every given condition must match (exact string
+        equality, inclusive ``since_ms``, exclusive ``until_ms``). Read only:
+        no config reload, no state cleanup and no upstream call."""
+        return self.audit_log.entries(tenant or None, limit, request_id=request_id,
+                                      trace_id=trace_id, route_id=route_id, status=status,
+                                      since_ms=since_ms, until_ms=until_ms)
 
     def breaker_reset(self, name: Optional[str] = None) -> List[str]:
         return self.breakers.reset(name)

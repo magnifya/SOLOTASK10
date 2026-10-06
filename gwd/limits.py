@@ -333,6 +333,66 @@ class QuotaLedger:
                 "by_policy": by_policy}
 
 
+class AuditQueryError(GatewayError):
+    """A rejected audit query filter; ``parameter`` names the offending field."""
+
+    def __init__(self, parameter: str) -> None:
+        super().__init__("invalid audit query", 400)
+        self.parameter = parameter
+
+
+_TRACE_ID_CHARS = frozenset("0123456789abcdef")
+
+
+def _audit_ms(raw: Optional[str], parameter: str) -> Optional[int]:
+    """Parse one millisecond timestamp filter; empty means no bound."""
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        raise AuditQueryError(parameter)
+
+
+def parse_audit_filters(raw: Dict[str, Optional[str]]) -> Dict[str, Any]:
+    """Validate raw audit query strings into typed filters for ``AuditLog.entries``.
+
+    A missing or empty value means "no condition"; every present value must be
+    valid -- an invalid one is rejected with :class:`AuditQueryError` naming the
+    parameter, never silently dropped. String conditions compare verbatim,
+    ``trace_id`` must be 32 lowercase hex characters, ``status`` a decimal
+    integer in [100, 599], and ``until`` must not precede ``since``.
+    """
+    out: Dict[str, Any] = {}
+    for name in ("request_id", "route_id"):
+        value = raw.get(name)
+        if value:
+            out[name] = value
+    trace_id = raw.get("trace_id")
+    if trace_id:
+        if len(trace_id) != 32 or any(c not in _TRACE_ID_CHARS for c in trace_id):
+            raise AuditQueryError("trace_id")
+        out["trace_id"] = trace_id
+    status = raw.get("status")
+    if status:
+        try:
+            status_int = int(status)
+        except ValueError:
+            raise AuditQueryError("status")
+        if not 100 <= status_int <= 599:
+            raise AuditQueryError("status")
+        out["status"] = status_int
+    since_ms = _audit_ms(raw.get("since"), "since")
+    until_ms = _audit_ms(raw.get("until"), "until")
+    if since_ms is not None:
+        out["since_ms"] = since_ms
+    if until_ms is not None:
+        out["until_ms"] = until_ms
+    if since_ms is not None and until_ms is not None and until_ms < since_ms:
+        raise AuditQueryError("until")
+    return out
+
+
 class AuditLog:
     """Append only request audit trail persisted as ``<root>/audit.jsonl``."""
 
@@ -345,10 +405,37 @@ class AuditLog:
         return entry
 
     def entries(self, tenant: Optional[str] = None,
-                limit: Optional[int] = None) -> List[Dict[str, Any]]:
+                limit: Optional[int] = None,
+                request_id: Optional[str] = None,
+                trace_id: Optional[str] = None,
+                route_id: Optional[str] = None,
+                status: Optional[int] = None,
+                since_ms: Optional[int] = None,
+                until_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Read the trail, keeping only rows that satisfy every given condition.
+
+        String conditions compare verbatim, ``since_ms`` is inclusive and
+        ``until_ms`` exclusive; a historical row missing a filtered field never
+        matches. Rows keep their original append order and ``limit`` keeps only
+        the last matching ones. Reading never writes to the trail.
+        """
         rows = _read_jsonl(self.path)
         if tenant:
             rows = [r for r in rows if r.get("tenant") == tenant]
+        if request_id:
+            rows = [r for r in rows if r.get("request_id") == request_id]
+        if trace_id:
+            rows = [r for r in rows if r.get("trace_id") == trace_id]
+        if route_id:
+            rows = [r for r in rows if r.get("route_id") == route_id]
+        if status is not None:
+            rows = [r for r in rows if r.get("status") == status]
+        if since_ms is not None:
+            rows = [r for r in rows
+                    if isinstance(r.get("at"), (int, float)) and r["at"] >= since_ms]
+        if until_ms is not None:
+            rows = [r for r in rows
+                    if isinstance(r.get("at"), (int, float)) and r["at"] < until_ms]
         if limit is not None and int(limit) > 0:
             rows = rows[-int(limit):]
         return rows
