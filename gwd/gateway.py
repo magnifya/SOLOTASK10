@@ -12,8 +12,8 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .breaker import TRANSPORT_ERROR, BreakerRegistry, RetryPolicy
-from .config import (ANY_TENANT, ApiKey, ConfigStore, GatewayError, QuotaPolicy,
-                     Route, parse, read_raw, save_config, sha256_hex)
+from .config import (ANY_TENANT, ApiKey, BodyTransform, ConfigStore, GatewayError,
+                     QuotaPolicy, Route, parse, read_raw, save_config, sha256_hex)
 from .limits import AuditLog, Limiter, QuotaLedger
 from .upstream import UpstreamError, default_registry
 
@@ -51,6 +51,25 @@ def _parse_traceparent(value: str) -> Optional[Tuple[str, str, str]]:
     if len(flags) != 2 or not _is_hex(flags):
         return None
     return trace_id, parent_id, flags
+
+
+def _apply_body_transform(spec: BodyTransform, text: str) -> Optional[str]:
+    """Apply a wrap/unwrap to a JSON document; ``None`` signals invalid input.
+
+    ``wrap`` accepts any JSON value and nests it under ``field`` in a new
+    top-level object; ``unwrap`` requires a top-level object carrying ``field``
+    and lifts that value out. An empty body, malformed JSON and an unwrap
+    target that is not an object or lacks the field all return ``None``.
+    """
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    if spec.operation == "wrap":
+        return json.dumps({spec.field: value}, sort_keys=True)
+    if not isinstance(value, dict) or spec.field not in value:
+        return None
+    return json.dumps(value[spec.field], sort_keys=True)
 
 
 class _IdempotencyScope(tuple):
@@ -414,6 +433,18 @@ class Gateway:
                                     "reset_at_ms": reset_at_ms},
                               extra_headers={"Retry-After": str(retry_after)})
 
+        # 3.5 request body transform: after auth, partition identity and quota,
+        # before idempotency and any upstream call. A rejection here never
+        # reaches the upstream, never touches the idempotency map and keeps
+        # attempts at 0; quota was already charged exactly once above.
+        upstream_body = body
+        if route.request_body is not None:
+            transformed = _apply_body_transform(route.request_body, body)
+            if transformed is None:
+                return finish(400, {"error": "invalid request body",
+                                    "request_id": request_id})
+            upstream_body = transformed
+
         # 4. idempotency
         body_hash = sha256_hex(body)
         idem_scope: Optional[_IdempotencyScope] = None
@@ -485,7 +516,9 @@ class Gateway:
         if "tracestate" in hdrs:
             # tracestate is forwarded verbatim and never feeds routing or quota.
             upstream_headers["tracestate"] = hdrs["tracestate"]
-        request = {"method": method, "path": path, "body": body, "tenant": tenant,
+        # The transformed body rides every retry and every failover hop; the
+        # idempotency hash above still covers the original client body.
+        request = {"method": method, "path": path, "body": upstream_body, "tenant": tenant,
                    "request_id": request_id, "headers": upstream_headers}
         response = None
         status = TRANSPORT_ERROR
@@ -531,12 +564,23 @@ class Gateway:
                 return finish(502, {"error": "upstream error", "request_id": request_id,
                                     "upstream": upstream_name})
             text = response["body"] if response else ""
+            if route.response_body is not None and status < 500:
+                # Applied exactly once, to the final response of the chain. A
+                # body that is not valid JSON (or an unwrap target that is not
+                # an object carrying the field) is a 502: attempts are kept,
+                # nothing is cached and the finally below frees the scope.
+                transformed = _apply_body_transform(route.response_body, text)
+                if transformed is None:
+                    return finish(502, {"error": "invalid upstream response body",
+                                        "request_id": request_id})
+                text = transformed
             if idem_scope is not None and status < 500:
                 # The marker becomes the cached response inside one critical
                 # section: a concurrent request can never observe the scope
                 # empty between the cache publish and the end of the in-flight
                 # state. The cache entry now owns the scope, so the finally
-                # release below is a no-op.
+                # release below is a no-op. The cached body is the transformed
+                # client response, so a replay never re-runs the transform.
                 self._idem_publish(idem_scope, in_flight, body_hash, now, status, text)
                 in_flight = None
             # A final 5xx keeps ``in_flight`` set, so the finally releases the

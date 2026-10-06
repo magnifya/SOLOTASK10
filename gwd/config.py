@@ -123,6 +123,46 @@ def _version_value(data: Dict[str, Any], where: str) -> Optional[str]:
     return raw
 
 
+BODY_OPERATIONS = ("wrap", "unwrap")
+
+
+@dataclass
+class BodyTransform:
+    """A JSON body wrap/unwrap: ``wrap`` nests any JSON value under ``field`` in a
+    new top-level object, ``unwrap`` lifts the value of ``field`` out of one."""
+
+    operation: str
+    field: str
+
+    def to_dict(self) -> Dict[str, str]:
+        return {"operation": self.operation, "field": self.field}
+
+
+def _body_transform(data: Dict[str, Any], key: str, where: str) -> Optional[BodyTransform]:
+    """Optional body transform: omitted means none; when present it must be an
+    object with exactly ``operation`` (``wrap`` or ``unwrap``) and ``field`` (a
+    non-empty string) -- null, any other type, extra keys and missing or invalid
+    members are all rejected."""
+    if key not in data:
+        return None
+    raw = data[key]
+    if not isinstance(raw, dict):
+        raise GatewayError("%s: %s must be an object with operation and field"
+                           % (where, key))
+    extra = sorted(set(raw) - {"operation", "field"})
+    if extra:
+        raise GatewayError("%s: %s allows only operation and field, got %s"
+                           % (where, key, ", ".join(extra)))
+    operation = raw.get("operation")
+    if operation not in BODY_OPERATIONS:
+        raise GatewayError("%s: %s operation must be one of %s"
+                           % (where, key, ", ".join(BODY_OPERATIONS)))
+    field = raw.get("field")
+    if not isinstance(field, str) or not field:
+        raise GatewayError("%s: %s field must be a non-empty string" % (where, key))
+    return BodyTransform(operation, field)
+
+
 def _unique(items: List[Any], pick: Callable[[Any], str], label: str) -> None:
     seen = set()
     for item in items:
@@ -144,6 +184,8 @@ class Route:
     weight: int = 1
     request_headers: Dict[str, str] = field(default_factory=dict)
     response_headers: Dict[str, str] = field(default_factory=dict)
+    request_body: Optional[BodyTransform] = None
+    response_body: Optional[BodyTransform] = None
     quota_policy: Optional[str] = None
     quota_policies: Optional[List[str]] = None
     quota_cost: int = 1
@@ -182,6 +224,8 @@ class Route:
                    weight=weight,
                    request_headers=_str_map(transform, "request_headers", "%s transform" % where),
                    response_headers=_str_map(transform, "response_headers", "%s transform" % where),
+                   request_body=_body_transform(transform, "request_body", "%s transform" % where),
+                   response_body=_body_transform(transform, "response_body", "%s transform" % where),
                    quota_policy=quota_policy,
                    quota_policies=quota_policies,
                    quota_cost=quota_cost,
@@ -190,6 +234,12 @@ class Route:
                    version=_version_value(data, where))
 
     def to_dict(self) -> Dict[str, Any]:
+        transform: Dict[str, Any] = {"request_headers": dict(self.request_headers),
+                                     "response_headers": dict(self.response_headers)}
+        if self.request_body is not None:
+            transform["request_body"] = self.request_body.to_dict()
+        if self.response_body is not None:
+            transform["response_body"] = self.response_body.to_dict()
         out = {"id": self.id, "tenant": self.tenant,
                "match": {"method": self.method, "path_prefix": self.path_prefix},
                "upstream": self.upstream, "auth_required": self.auth_required,
@@ -197,8 +247,7 @@ class Route:
                "quota_cost": self.quota_cost,
                "timeout_ms": self.timeout_ms, "scopes": list(self.scopes),
                "fallback_upstreams": list(self.fallback_upstreams),
-               "transform": {"request_headers": dict(self.request_headers),
-                             "response_headers": dict(self.response_headers)}}
+               "transform": transform}
         if self.quota_policies is not None:
             out["quota_policies"] = list(self.quota_policies)
         if self.version is not None:

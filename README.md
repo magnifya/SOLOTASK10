@@ -3,8 +3,9 @@
 `gwd` is a minimal but real API gateway skeleton written with the Python standard
 library only. It owns the cross cutting concerns of an internal API platform:
 versioned routing, API key authentication, quota governance with a usage ledger,
-circuit breaking, bounded retries, request/response header transformation,
-idempotent replay protection, per tenant isolation and an audit trail.
+circuit breaking, bounded retries, request/response header and JSON body
+transformation, idempotent replay protection, per tenant isolation and an audit
+trail.
 
 It runs offline, on Python 3.10+, on Linux (WSL Ubuntu-24.04) or Windows. There
 are no third party dependencies and no network calls except to the upstreams you
@@ -109,7 +110,9 @@ tests; only the HTTP front end reads the wall clock.
 8. **Transforms.** `transform.request_headers` are added to the upstream call,
    `transform.response_headers` are added to the reply. Credential headers
    (`Authorization`, `X-Api-Key`) and hop-by-hop headers are stripped before the
-   upstream call.
+   upstream call. `transform.request_body` and `transform.response_body`
+   optionally wrap/unwrap the JSON bodies (see
+   [Body transforms](#body-transforms)).
 9. **Audit.** One JSON line per request is appended to `<data-dir>/audit.jsonl`
    with `at`, `request_id`, `tenant`, `key_id`, `route_id`, `upstream`, `status`,
    `latency_ms`, `attempts`, `quota{policy_id,allowed,remaining,cost}` and
@@ -240,6 +243,55 @@ in-flight requests keep the order they started with — and editing
 `fallback_upstreams` resets neither quota buckets nor breaker state. An
 invalid reload keeps the last valid configuration, the quota buckets, the
 breaker states and the existing health feedback.
+
+## Body transforms
+
+A route's `transform` may additionally declare `request_body` and/or
+`response_body`. Each must be an object with exactly two members:
+
+* `operation` — `wrap` or `unwrap`;
+* `field` — a non-empty string naming the top-level object field.
+
+`null`, a non-object, extra keys, a missing member, any other operation or an
+empty/non-string field are rejected with a `GatewayError` at config load, in
+`route-add` and on hot reload — a rejected batch add or reload keeps the old
+configuration, revision, quota buckets, breaker states and idempotency state.
+Omitting both fields (or loading a document written before they existed) keeps
+the historical pass-through behaviour, and `GET /v1/config` echoes them inside
+each route's `transform` only when they are set.
+
+The **request** transform runs after authentication, partition identity and
+the quota check, before idempotency and any upstream call:
+
+* `wrap` parses the body as UTF-8 JSON and nests whatever JSON value it finds
+  (object, array, string, number, boolean or null) under `field` in a new
+  top-level object;
+* `unwrap` requires a top-level JSON object carrying `field` and sends that
+  field's value as the new request body.
+
+An empty body, malformed JSON, or an unwrap target that is not an object or
+lacks the field is rejected with `400 {"error":"invalid request body",
+"request_id":...}`: the request never calls an upstream, never writes
+idempotency state, is still charged exactly once at the quota step and audits
+one entry with `attempts: 0`. The idempotency body hash always covers the
+**original** client body, so two different originals that unwrap to the same
+upstream body still conflict (`409`). The transformed body is what every retry
+and every failover hop receives.
+
+The **response** transform runs exactly once, on the final response of the
+upstream chain, and only when its status is below `500`:
+
+* the upstream body is parsed as JSON and wrapped/unwrapped the same way; the
+  status is unchanged and the reply is the transformed JSON;
+* a body that is not valid JSON, or an unwrap target that is not an object or
+  lacks the field, becomes `502 {"error":"invalid upstream response body",
+  "request_id":...}` — the audit entry keeps the real `attempts` and nothing
+  is cached;
+* a final `5xx`, a transport failure and routes without a configured response
+  transform keep their historical results untouched.
+
+The idempotency cache stores the **transformed** client response, so a replay
+returns it directly without calling the upstream or re-running the transform.
 
 ## Key disabling and expiry
 
@@ -458,7 +510,9 @@ health feedback through the usual `ready` / `last_error` channel.
     "upstream": "echo",
     "auth_required": true, "weight": 1, "scopes": ["read"],
     "transform": {"request_headers": {"X-Tenant": "acme"},
-                  "response_headers": {"X-Served-By": "gwd"}},
+                  "response_headers": {"X-Served-By": "gwd"},
+                  "request_body": {"operation": "wrap", "field": "payload"},
+                  "response_body": {"operation": "unwrap", "field": "result"}},
     "quota_policy": "p-api", "timeout_ms": 5000,
     "fallback_upstreams": ["echo-dr"], "version": "v1"
   }, {
