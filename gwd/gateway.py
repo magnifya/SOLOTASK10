@@ -324,6 +324,15 @@ class Gateway:
             # No route for this tenant: retry without the tenant filter so the
             # request is rejected by authentication (401/403) instead of 404.
             candidates = self.config.matching_routes(method, path, None)
+        # Header conditions: a route declaring match.headers is a candidate
+        # only when every condition is satisfied by the request headers. When
+        # at least one conditional route is satisfied, only those routes
+        # continue; otherwise the unconditional routes are the candidates.
+        satisfied = [r for r in candidates if r.match_headers and r.headers_satisfied(hdrs)]
+        if satisfied:
+            candidates = satisfied
+        else:
+            candidates = [r for r in candidates if not r.match_headers]
         if not candidates:
             return finish(404, {"error": "no route for %s %s" % (method, path), "request_id": request_id})
         # API version filter: a missing or blank X-Api-Version header reaches
@@ -663,13 +672,17 @@ class Gateway:
 
     @staticmethod
     def _pick_route(candidates: List[Route], selector: str) -> Route:
-        """Longest path prefix wins; ties are resolved by weighted stable hashing.
+        """Longest path prefix wins, then the most declared header conditions;
+        remaining ties are resolved by weighted stable hashing.
 
         ``bucket = int(sha256("<key_id>|<request_id>").hexdigest()[:16], 16) % total_weight``
         then candidates sorted by route id consume the range ``[0, total_weight)``.
         """
         best = max(len(route.path_prefix) for route in candidates)
-        pool = sorted((r for r in candidates if len(r.path_prefix) == best), key=lambda r: r.id)
+        pool = [route for route in candidates if len(route.path_prefix) == best]
+        most = max(len(route.match_headers or ()) for route in pool)
+        pool = sorted((r for r in pool if len(r.match_headers or ()) == most),
+                      key=lambda r: r.id)
         if len(pool) == 1:
             return pool[0]
         total = sum(route.weight for route in pool)

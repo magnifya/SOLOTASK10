@@ -123,6 +123,33 @@ def _version_value(data: Dict[str, Any], where: str) -> Optional[str]:
     return raw
 
 
+def _match_headers(match: Dict[str, Any], where: str) -> Optional[Dict[str, str]]:
+    """Optional ``match.headers`` gray-routing conditions: omitted means the
+    route is unconditional; when present it must be an object mapping non-empty
+    string header names to non-empty string values, and no two names may be
+    equal ignoring case. ``null``, a non-object, a non-string or empty name or
+    value all raise the same validation error."""
+    if "headers" not in match:
+        return None
+    raw = match["headers"]
+    if not isinstance(raw, dict):
+        raise GatewayError(
+            "route match.headers must map non-empty string names to string values")
+    out: Dict[str, str] = {}
+    seen = set()
+    for name, value in raw.items():
+        if not isinstance(name, str) or not name \
+                or not isinstance(value, str) or not value:
+            raise GatewayError(
+                "route match.headers must map non-empty string names to string values")
+        lowered = name.lower()
+        if lowered in seen:
+            raise GatewayError("route match.headers contains duplicate header names")
+        seen.add(lowered)
+        out[name] = value
+    return out
+
+
 BODY_OPERATIONS = ("wrap", "unwrap")
 
 
@@ -193,6 +220,7 @@ class Route:
     scopes: List[str] = field(default_factory=list)
     fallback_upstreams: List[str] = field(default_factory=list)
     version: Optional[str] = None
+    match_headers: Optional[Dict[str, str]] = None
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "route") -> "Route":
@@ -231,7 +259,8 @@ class Route:
                    quota_cost=quota_cost,
                    timeout_ms=timeout_ms, scopes=_str_list(data, "scopes", where),
                    fallback_upstreams=_fallback_list(data, "fallback_upstreams", where, upstream),
-                   version=_version_value(data, where))
+                   version=_version_value(data, where),
+                   match_headers=_match_headers(match, where))
 
     def to_dict(self) -> Dict[str, Any]:
         transform: Dict[str, Any] = {"request_headers": dict(self.request_headers),
@@ -240,8 +269,13 @@ class Route:
             transform["request_body"] = self.request_body.to_dict()
         if self.response_body is not None:
             transform["response_body"] = self.response_body.to_dict()
+        match: Dict[str, Any] = {"method": self.method, "path_prefix": self.path_prefix}
+        if self.match_headers is not None:
+            # Echoed exactly as declared (original name casing), and only on
+            # routes that declared the field at all.
+            match["headers"] = dict(self.match_headers)
         out = {"id": self.id, "tenant": self.tenant,
-               "match": {"method": self.method, "path_prefix": self.path_prefix},
+               "match": match,
                "upstream": self.upstream, "auth_required": self.auth_required,
                "weight": self.weight, "quota_policy": self.quota_policy,
                "quota_cost": self.quota_cost,
@@ -261,6 +295,17 @@ class Route:
         if tenant is not None and self.tenant not in (ANY_TENANT, tenant):
             return False
         return path.startswith(self.path_prefix)
+
+    def headers_satisfied(self, hdrs: Dict[str, str]) -> bool:
+        """Whether every declared ``match.headers`` condition holds for a request.
+
+        ``hdrs`` carries lower-cased header names; condition names compare
+        case-insensitively while values compare as the exact original string --
+        no trimming, no wildcards. A missing header or an unequal value fails
+        the route, and every condition must hold at once.
+        """
+        return all(hdrs.get(name.lower()) == value
+                   for name, value in (self.match_headers or {}).items())
 
 
 @dataclass

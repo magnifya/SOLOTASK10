@@ -55,7 +55,12 @@ tests; only the HTTP front end reads the wall clock.
    request method, its `path_prefix` is a prefix of the path, and its `tenant` is
    `*` or equals the request tenant. If nothing matches the tenant, matching is
    retried with the tenant filter relaxed so that a request without a valid key is
-   rejected by authentication (401/403) rather than reported as 404.
+   rejected by authentication (401/403) rather than reported as 404. On top of
+   that, a route declaring `match.headers` is a candidate only when **every**
+   condition is satisfied by the request headers; when at least one conditional
+   route is satisfied, only those routes continue, otherwise the unconditional
+   routes are the candidates (see
+   [Header-based gray routing](#header-based-gray-routing)).
 2. **API version filter.** A route may declare an optional `version` (a non-empty
    string; `null`, `""` or any other type is rejected at load and in
    `route-add`). A request without `X-Api-Version` (or with a blank one) reaches
@@ -70,8 +75,9 @@ tests; only the HTTP front end reads the wall clock.
    writes one audit record with `route_id: null` and `attempts: 0`. A versioned
    route's replies carry `X-Api-Version: <version>`, overriding any
    `transform.response_headers` entry of the same name.
-3. **Weighted pick.** Among candidates the longest `path_prefix` wins. Ties are
-   resolved by weighted stable hashing (see below).
+3. **Weighted pick.** Among candidates the longest `path_prefix` wins; ties go
+   to the routes declaring the most `match.headers` conditions, and any
+   remaining tie is resolved by weighted stable hashing (see below).
 4. **Auth.** Missing or unknown secret -> `401`; a stated `X-Api-Key` that does not
    match the presented secret -> `401`; a disabled or expired key -> `401`
    (`api key disabled` / `api key expired`, see
@@ -141,6 +147,52 @@ The choice depends only on the key id and the request id, never on time or on
 process state, so the same caller is sticky to the same backend and a replay of
 the same request id always lands on the same route. Weights are relative: routes
 with weights 1 and 3 split traffic 25% / 75%.
+
+## Header-based gray routing
+
+A route's `match` may declare `headers`, an object mapping header names to the
+exact values a request must carry to enter that route's dedicated backend —
+for example `"headers": {"X-Gray-Channel": "beta"}` lets callers marked
+`beta` reach a canary upstream while everyone else stays on the default route.
+Omitting the field (or loading a document written before it existed) keeps the
+historical method/path/tenant semantics untouched.
+
+Validation runs at config load, in `route-add` and on hot reload, always with
+the same messages: `null`, a non-object, a non-string or empty name, a
+non-string or empty value all fail with a `GatewayError` (`400`) saying
+`route match.headers must map non-empty string names to string values`, and two
+names equal ignoring case fail with
+`route match.headers contains duplicate header names`. A rejected batch
+`route-add` writes none of its routes; an invalid reload answers the usual
+`{"reloaded": false, "ready": false, "error": ...}` and keeps the previous
+configuration, quota buckets, breaker states and idempotency cache.
+`GET /v1/config` echoes `match.headers` exactly as declared (original name
+casing) on the routes that declared it, and omits it everywhere else.
+
+Matching compares header **names** case-insensitively and **values** as the
+exact original string — no trimming, no wildcards — and every condition in the
+object must hold at once; a missing header or an unequal value means the route
+is not a candidate. `Gateway.handle`, the HTTP proxy and `route-add` all run
+this single rule. Candidate selection works in layers:
+
+1. the existing tenant matching (with the no-tenant fallback) runs first;
+2. header conditions apply next: if any route declaring `headers` is fully
+   satisfied, **only** the satisfied conditional routes continue; otherwise
+   the unconditional routes are the candidates;
+3. the version filter and the pick then run unchanged on that set — longest
+   `path_prefix` first, then the routes declaring the most conditions, and any
+   remaining tie is decided by the existing `<key_id>|<request_id>` weighted
+   stable hash.
+
+When no header condition matches, the available unconditional candidates are
+used; when nothing is a candidate at all, the response is the usual `404`.
+With only unconditional routes configured, selection and responses are
+identical to before. Everything downstream of the pick — authentication,
+quota, idempotency, breaker retries, transforms, audit and tracing — keeps its
+existing order and results, and an unsupported version still answers `406`
+before authentication. A valid hot reload applies the new conditions to new
+requests only: in-flight requests keep the routes they started with, and quota
+buckets, breaker state, the idempotency cache and audit fields are preserved.
 
 ## Idempotency (documented rule)
 
@@ -516,6 +568,11 @@ health feedback through the usual `ready` / `last_error` channel.
     "quota_policy": "p-api", "timeout_ms": 5000,
     "fallback_upstreams": ["echo-dr"], "version": "v1"
   }, {
+    "id": "r-gray", "tenant": "acme",
+    "match": {"method": "GET", "path_prefix": "/api",
+              "headers": {"X-Gray-Channel": "beta"}},
+    "upstream": "echo-canary", "auth_required": true
+  }, {
     "id": "r-both", "tenant": "acme",
     "match": {"method": "GET", "path_prefix": "/both"},
     "upstream": "echo", "auth_required": true,
@@ -542,7 +599,11 @@ satisfies any requirement. `tenant: "*"` marks a route shared by every tenant.
 `partition_by` defaults to `"policy"` and accepts only `"policy"`, `"tenant"`
 and `"key"` (see [Quota partitions](#quota-partitions)). `fallback_upstreams`
 defaults to `[]` and lists the ordered failover upstreams (see
-[Fallback upstreams](#fallback-upstreams)). `version` is optional; when present
+[Fallback upstreams](#fallback-upstreams)). `match.headers` is optional and
+opts the route into header-based gray routing (see
+[Header-based gray routing](#header-based-gray-routing)); the sanitized
+`GET /v1/config` echoes it only on routes that declared it. `version` is
+optional; when present
 it must be a non-empty string and it opts the route into API version filtering
 (see [Request pipeline](#request-pipeline)) — the sanitized `GET /v1/config`
 echoes `version` only on routes that declared it. `quota_cost` is optional,
@@ -551,6 +612,10 @@ defaults to `1` and is echoed on every route (see
 malformed documents with `GatewayError` (unknown algorithm, an invalid
 `partition_by`, an invalid `fallback_upstreams`, a non-boolean `enabled`, an
 invalid `expires_at_ms`, a `version` that is null, empty or not a string,
+a malformed `match.headers` — `null`, a non-object, a non-string or empty name
+or value (`route match.headers must map non-empty string names to string
+values`), or names equal ignoring case (`route match.headers contains
+duplicate header names`),
 non-positive
 `limit`/`window_ms`/`burst`/`weight`,
 a `quota_cost` that is null, boolean, not an integer or below 1
