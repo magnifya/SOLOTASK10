@@ -115,11 +115,18 @@ tests; only the HTTP front end reads the wall clock.
    open breaker returns `503 {"error":"upstream unavailable","state":"open"}`
    without calling the upstream. Only `408, 429, 500, 502, 503, 504` and
    transport errors are retried, bounded by `RetryPolicy(max_attempts, base_ms,
-   max_ms)`. When the route names `fallback_upstreams`, a GET request (or any
-   request carrying a non-empty `X-Idempotency-Key`) walks the primary plus the
-   fallbacks in order: each upstream keeps its own retry budget and breaker, a
-   breaker rejection skips it silently, and only a transport error or a 5xx
-   left after the retries moves to the next upstream (see
+   max_ms)`. A route may carry its own budget as
+   `retry: {"max_attempts", "base_ms", "max_ms"}` (all three required, plain
+   integers, `max_attempts >= 1`, `base_ms >= 0`, `max_ms >= 1` and not below
+   `base_ms`; anything else is rejected with `route retry policy is invalid`).
+   The route's budget is frozen for the request at route selection and applies
+   to the primary and every fallback alike; routes without `retry` ride the
+   gateway-wide policy, and `GET /v1/config` echoes `retry` only on routes
+   that declare it. When the route names `fallback_upstreams`, a GET request
+   (or any request carrying a non-empty `X-Idempotency-Key`) walks the primary
+   plus the fallbacks in order: each upstream keeps its own retry budget and
+   breaker, a breaker rejection skips it silently, and only a transport error
+   or a 5xx left after the retries moves to the next upstream (see
    [Fallback upstreams](#fallback-upstreams)).
 9. **Transforms.** `transform.request_headers` are added to the upstream call,
    `transform.response_headers` are added to the reply. Credential headers

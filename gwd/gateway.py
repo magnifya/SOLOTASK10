@@ -387,6 +387,12 @@ class Gateway:
         selector = "%s|%s" % (key.key_id if key else "-", request_id)
         route = self._pick_route(candidates, selector)
         joint = route.quota_policies is not None
+        # The retry budget is frozen for this request at route selection: a
+        # route with an explicit retry block uses its own attempts and backoff
+        # caps, any other route rides the gateway-wide policy. A hot reload
+        # swaps the whole config object, never this local reference, so an
+        # in-flight request always finishes on the policy it started with.
+        retry_policy = route.retry if route.retry is not None else self.retry_policy
         # The fixed cost is read once from the selected route snapshot and
         # rides the whole pipeline: a hot reload swapping the config mid-request
         # keeps this local route object, so in-flight requests are always billed
@@ -573,7 +579,7 @@ class Gateway:
                         rejected_state = breaker.state
                     continue
                 attempt = 0
-                while attempt < self.retry_policy.max_attempts:
+                while attempt < retry_policy.max_attempts:
                     attempt += 1
                     attempts += 1
                     try:
@@ -582,10 +588,10 @@ class Gateway:
                     except UpstreamError:
                         response = None
                         status = TRANSPORT_ERROR
-                    if not self.retry_policy.should_retry(attempt, status):
+                    if not retry_policy.should_retry(attempt, status):
                         break
                     if self.sleep_fn is not None:
-                        self.sleep_fn(self.retry_policy.delay_ms(attempt))
+                        self.sleep_fn(retry_policy.delay_ms(attempt))
                 breaker.record(status != TRANSPORT_ERROR and status < 500, now)
                 if attempt:
                     upstream_name = name

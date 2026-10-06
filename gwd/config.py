@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from .breaker import RetryPolicy
+
 ALGORITHMS = ("token-bucket", "leaky-bucket", "sliding-window")
 PARTITION_MODES = ("policy", "tenant", "key")
 ANY_TENANT = "*"
@@ -197,6 +199,35 @@ def _unique(items: List[Any], pick: Callable[[Any], str], label: str) -> None:
         seen.add(pick(item))
 
 
+RETRY_FIELDS = ("max_attempts", "base_ms", "max_ms")
+
+
+def _retry_policy(data: Dict[str, Any], where: str) -> Optional[RetryPolicy]:
+    """Optional per-route retry budget: omitted means the route rides the
+    gateway-wide ``RetryPolicy``; when present it must be an object with
+    exactly ``max_attempts``, ``base_ms`` and ``max_ms``, all plain integers
+    (never booleans) with ``max_attempts >= 1``, ``base_ms >= 0`` and
+    ``max_ms >= 1`` and not below ``base_ms`` -- a missing member, null, any
+    other type, an extra key or an out-of-range value is all rejected with the
+    same fixed message."""
+    if "retry" not in data:
+        return None
+    raw = data["retry"]
+    if not isinstance(raw, dict) or set(raw) != set(RETRY_FIELDS):
+        raise GatewayError("route retry policy is invalid")
+    values: Dict[str, int] = {}
+    for key in RETRY_FIELDS:
+        value = raw[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise GatewayError("route retry policy is invalid")
+        values[key] = value
+    if (values["max_attempts"] < 1 or values["base_ms"] < 0
+            or values["max_ms"] < 1 or values["max_ms"] < values["base_ms"]):
+        raise GatewayError("route retry policy is invalid")
+    return RetryPolicy(max_attempts=values["max_attempts"],
+                       base_ms=values["base_ms"], max_ms=values["max_ms"])
+
+
 @dataclass
 class Route:
     """One routing rule: match a method plus path prefix onto an upstream."""
@@ -220,6 +251,7 @@ class Route:
     fallback_upstreams: List[str] = field(default_factory=list)
     version: Optional[str] = None
     match_headers: Optional[Dict[str, str]] = None
+    retry: Optional[RetryPolicy] = None
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "route") -> "Route":
@@ -259,7 +291,8 @@ class Route:
                    timeout_ms=timeout_ms, scopes=_str_list(data, "scopes", where),
                    fallback_upstreams=_fallback_list(data, "fallback_upstreams", where, upstream),
                    version=_version_value(data, where),
-                   match_headers=_match_headers(match))
+                   match_headers=_match_headers(match),
+                   retry=_retry_policy(data, where))
 
     def to_dict(self) -> Dict[str, Any]:
         transform: Dict[str, Any] = {"request_headers": dict(self.request_headers),
@@ -285,6 +318,13 @@ class Route:
             out["quota_policies"] = list(self.quota_policies)
         if self.version is not None:
             out["version"] = self.version
+        if self.retry is not None:
+            # Echoed back exactly as declared, so GET /v1/config and a
+            # route-add round trip show the explicit per-route budget; routes
+            # without one keep the historical shape with no retry key at all.
+            out["retry"] = {"max_attempts": self.retry.max_attempts,
+                            "base_ms": self.retry.base_ms,
+                            "max_ms": self.retry.max_ms}
         return out
 
     def matches(self, method: str, path: str, tenant: Optional[str]) -> bool:
