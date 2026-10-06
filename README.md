@@ -56,7 +56,19 @@ tests; only the HTTP front end reads the wall clock.
    `*` or equals the request tenant. If nothing matches the tenant, matching is
    retried with the tenant filter relaxed so that a request without a valid key is
    rejected by authentication (401/403) rather than reported as 404.
-2. **API version filter.** A route may declare an optional `version` (a non-empty
+2. **Header conditions.** A route's `match` may declare an optional `headers`
+   object mapping non-empty string names to non-empty string values (`null`, a
+   non-object, a non-string or empty name or value is rejected at load and in
+   `route-add` with `route match.headers must map non-empty string names to
+   string values`; two names differing only by case are rejected with `route
+   match.headers contains duplicate header names`). A declared route is a
+   candidate only when every pair is present on the request — header names
+   compare case-insensitively, values compare verbatim with no trimming or
+   wildcards. When at least one declared route is satisfied, only those routes
+   continue; otherwise the unconditional routes are the candidates, and when
+   none exist the answer is the usual 404. `GET /v1/config` echoes the object
+   exactly as declared.
+3. **API version filter.** A route may declare an optional `version` (a non-empty
    string; `null`, `""` or any other type is rejected at load and in
    `route-add`). A request without `X-Api-Version` (or with a blank one) reaches
    only unversioned routes; a non-blank value reaches only routes that declared
@@ -70,16 +82,17 @@ tests; only the HTTP front end reads the wall clock.
    writes one audit record with `route_id: null` and `attempts: 0`. A versioned
    route's replies carry `X-Api-Version: <version>`, overriding any
    `transform.response_headers` entry of the same name.
-3. **Weighted pick.** Among candidates the longest `path_prefix` wins. Ties are
-   resolved by weighted stable hashing (see below).
-4. **Auth.** Missing or unknown secret -> `401`; a stated `X-Api-Key` that does not
+4. **Weighted pick.** Among candidates the longest `path_prefix` wins, then the
+   route declaring the most header conditions. Remaining ties are resolved by
+   weighted stable hashing (see below).
+5. **Auth.** Missing or unknown secret -> `401`; a stated `X-Api-Key` that does not
    match the presented secret -> `401`; a disabled or expired key -> `401`
    (`api key disabled` / `api key expired`, see
    [Key disabling and expiry](#key-disabling-and-expiry)); key tenant different
    from the route tenant, or a missing route scope -> `403`. Routes with
    `"auth_required": false` skip this step. Only `sha256(secret)` is ever stored,
    and it is compared in constant time.
-5. **Quota.** A route names one policy (`quota_policy`, the historical form) or
+6. **Quota.** A route names one policy (`quota_policy`, the historical form) or
    an ordered, non-empty list (`quota_policies`, joint admission). Each named
    policy charges the route's fixed `quota_cost` units (default `1` when the
    field is omitted) against the partition resolved for that policy (see below);
@@ -95,9 +108,9 @@ tests; only the HTTP front end reads the wall clock.
    policy, each carrying the full cost). Identity rejections raised while
    resolving a partition (`400`/`401`/`403`) consume no quota, write no usage
    and never call the upstream, but are still audited.
-6. **Idempotency.** See below; a replay short circuits the rest of the pipeline,
+7. **Idempotency.** See below; a replay short circuits the rest of the pipeline,
    and a request that meets one still in flight is rejected immediately (425/409).
-7. **Circuit breaker + retries + failover.** One breaker per upstream name; an
+8. **Circuit breaker + retries + failover.** One breaker per upstream name; an
    open breaker returns `503 {"error":"upstream unavailable","state":"open"}`
    without calling the upstream. Only `408, 429, 500, 502, 503, 504` and
    transport errors are retried, bounded by `RetryPolicy(max_attempts, base_ms,
@@ -107,13 +120,13 @@ tests; only the HTTP front end reads the wall clock.
    breaker rejection skips it silently, and only a transport error or a 5xx
    left after the retries moves to the next upstream (see
    [Fallback upstreams](#fallback-upstreams)).
-8. **Transforms.** `transform.request_headers` are added to the upstream call,
+9. **Transforms.** `transform.request_headers` are added to the upstream call,
    `transform.response_headers` are added to the reply. Credential headers
    (`Authorization`, `X-Api-Key`) and hop-by-hop headers are stripped before the
    upstream call. `transform.request_body` and `transform.response_body`
    optionally wrap/unwrap the JSON bodies (see
    [Body transforms](#body-transforms)).
-9. **Audit.** One JSON line per request is appended to `<data-dir>/audit.jsonl`
+10. **Audit.** One JSON line per request is appended to `<data-dir>/audit.jsonl`
    with `at`, `request_id`, `tenant`, `key_id`, `route_id`, `upstream`, `status`,
    `latency_ms`, `attempts`, `quota{policy_id,allowed,remaining,cost}` and
    `idempotent_replay`; `cost` is the actual charge applied (the route's
@@ -127,7 +140,9 @@ tests; only the HTTP front end reads the wall clock.
 
 ## Weighted routing (documented rule)
 
-When several candidates share the longest matching prefix, the pick is:
+When several candidates share the longest matching prefix, only the routes
+declaring the most header conditions stay in the pool, and the pick among the
+remaining ties is:
 
 ```
 selector = "<key_id>|<request_id>"          # key_id is "-" when unauthenticated

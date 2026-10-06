@@ -111,6 +111,32 @@ def _quota_cost(data: Dict[str, Any], where: str) -> int:
     return int(raw)
 
 
+def _match_headers(match: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Optional header conditions of a route match: omitted means an
+    unconditional route; when present it must be an object mapping non-empty
+    string names to non-empty string values -- null, any other type, an empty
+    name or value and any non-string entry are all rejected, and so are two
+    names that differ only by case (matching is case-insensitive on names)."""
+    if "headers" not in match:
+        return None
+    raw = match["headers"]
+    if not isinstance(raw, dict):
+        raise GatewayError("route match.headers must map non-empty string names "
+                           "to string values")
+    out: Dict[str, str] = {}
+    seen = set()
+    for name, value in raw.items():
+        if not isinstance(name, str) or not name or not isinstance(value, str) or not value:
+            raise GatewayError("route match.headers must map non-empty string names "
+                               "to string values")
+        lowered = name.lower()
+        if lowered in seen:
+            raise GatewayError("route match.headers contains duplicate header names")
+        seen.add(lowered)
+        out[name] = value
+    return out
+
+
 def _version_value(data: Dict[str, Any], where: str) -> Optional[str]:
     """Optional API version: omitted means an unversioned (legacy) route; when
     present it must be a non-empty string -- null, an empty string or any other
@@ -193,6 +219,7 @@ class Route:
     scopes: List[str] = field(default_factory=list)
     fallback_upstreams: List[str] = field(default_factory=list)
     version: Optional[str] = None
+    match_headers: Optional[Dict[str, str]] = None
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "route") -> "Route":
@@ -231,7 +258,8 @@ class Route:
                    quota_cost=quota_cost,
                    timeout_ms=timeout_ms, scopes=_str_list(data, "scopes", where),
                    fallback_upstreams=_fallback_list(data, "fallback_upstreams", where, upstream),
-                   version=_version_value(data, where))
+                   version=_version_value(data, where),
+                   match_headers=_match_headers(match))
 
     def to_dict(self) -> Dict[str, Any]:
         transform: Dict[str, Any] = {"request_headers": dict(self.request_headers),
@@ -240,8 +268,13 @@ class Route:
             transform["request_body"] = self.request_body.to_dict()
         if self.response_body is not None:
             transform["response_body"] = self.response_body.to_dict()
+        match: Dict[str, Any] = {"method": self.method, "path_prefix": self.path_prefix}
+        if self.match_headers is not None:
+            # Echoed back exactly as declared, so GET /v1/config and a
+            # route-add round trip keep the original header names and values.
+            match["headers"] = dict(self.match_headers)
         out = {"id": self.id, "tenant": self.tenant,
-               "match": {"method": self.method, "path_prefix": self.path_prefix},
+               "match": match,
                "upstream": self.upstream, "auth_required": self.auth_required,
                "weight": self.weight, "quota_policy": self.quota_policy,
                "quota_cost": self.quota_cost,
@@ -261,6 +294,14 @@ class Route:
         if tenant is not None and self.tenant not in (ANY_TENANT, tenant):
             return False
         return path.startswith(self.path_prefix)
+
+    def headers_satisfied_by(self, hdrs: Dict[str, str]) -> bool:
+        """True when every declared match header is present on the request with
+        an exactly equal value -- names compare case-insensitively (``hdrs``
+        keys are already lowercase), values compare verbatim with no trimming
+        or wildcards. An unconditional route is always satisfied."""
+        return all(hdrs.get(name.lower()) == value
+                   for name, value in (self.match_headers or {}).items())
 
 
 @dataclass
