@@ -681,6 +681,18 @@ class Gateway:
             if self._idempotency.get(scope) is marker:
                 self._idempotency.pop(scope, None)
 
+    def resolve_admin_key(self, hdrs: Dict[str, str],
+                          now_ms: int) -> Tuple[Optional[ApiKey], Optional[str]]:
+        """Resolve an admin-surface credential exactly like a proxy request.
+
+        The ``/v1`` admin wall shares the proxy pipeline's resolution, so
+        ``Authorization: Bearer`` and ``X-Api-Key-Secret`` are equivalent, a
+        stated ``X-Api-Key`` must match the secret, and disabled/expired keys
+        report the same fixed 401 reasons; the validity check uses the
+        request's start time.
+        """
+        return self._resolve_key(hdrs, now_ms)
+
     def _resolve_key(self, hdrs: Dict[str, str],
                      now_ms: int) -> Tuple[Optional[ApiKey], Optional[str]]:
         """Resolve the API key from the presented secret; the sha256 is compared.

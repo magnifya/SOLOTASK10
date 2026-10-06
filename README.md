@@ -581,7 +581,9 @@ health feedback through the usual `ready` / `last_error` channel.
                      {"id": "p-tenant-total", "tenant": "acme", "algorithm": "token-bucket",
                       "limit": 100, "window_ms": 1000, "partition_by": "tenant"},
                      {"id": "p-key-budget", "tenant": "acme", "algorithm": "sliding-window",
-                      "limit": 5, "window_ms": 1000, "partition_by": "key"}]
+                      "limit": 5, "window_ms": 1000, "partition_by": "key"}],
+  "admin_auth": {"enabled": false, "read_scopes": ["admin"],
+                 "write_scopes": ["admin"]}
 }
 ```
 
@@ -608,27 +610,31 @@ a `quota_cost` that is null, boolean, not an integer or below 1
 `path_prefix` without a leading `/`, malformed `secret_sha256`, duplicate ids, a
 route naming an unknown quota policy, or a malformed `quota_policies` — `null`,
 empty, non-array, non-string/empty entries, duplicates or both `quota_policy`
-and `quota_policies` set). `reload_if_changed()` re-reads the file
+and `quota_policies` set, or a malformed root `admin_auth` section
+(`admin_auth configuration is invalid`, see
+[Admin surface authentication](#admin-surface-authentication))). `reload_if_changed()` re-reads the file
 only when its mtime moved and keeps `ready` true only when the new document is
 valid; an invalid reload keeps the last known good config, sets `ready = false`
 and records `last_error`.
 
 ## HTTP API
 
-Errors are always JSON: `{"error": "...", "request_id": "..."}`. Admin endpoints
-are unauthenticated in this skeleton - front them with your own auth in production.
+Errors are always JSON: `{"error": "...", "request_id": "..."}`. `/healthz` is
+always open and the proxy surface authenticates through the pipeline; the
+`/v1` admin commands below are open only while the root `admin_auth` policy is
+absent or disabled (see [Admin surface authentication](#admin-surface-authentication)).
 
 | Method | Path | Success | Errors |
 | --- | --- | --- | --- |
 | GET | `/healthz` | `200 {"ok","ready","revision","routes","upstreams","config_error"}` | - |
-| GET | `/v1/config` | `200` sanitized config (never any secret or hash) | - |
-| POST | `/v1/config/reload` | `200 {"reloaded","revision","ready","error"}` | - |
-| POST | `/v1/keys` | `201 {"key_id","tenant","scopes","secret_sha256","enabled","expires_at_ms","secret"}` (secret returned once) | `400` bad JSON / missing tenant / invalid `enabled` or `expires_at_ms`, `409` duplicate key id |
-| POST | `/v1/keys/{key_id}/rotate` | `200` same fields as `POST /v1/keys` with the new `secret` (returned once) | `400` empty key id / non-object or malformed body, `404` unknown key id |
-| POST | `/v1/quota/policies` | `201` policy object (echoes `partition_by`) | `400` invalid policy / `partition_by`, `409` duplicate id |
-| GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | `400` non-integer `since` |
-| GET | `/v1/audit?tenant=&limit=&request_id=&trace_id=&route_id=&status=&since=&until=` | `200 {"tenant","count","entries"}` | `400 {"error":"invalid audit query","parameter",...}` for a malformed `trace_id` (not 32 lowercase hex), `status` (not a 100-599 decimal integer), non-integer `since`/`until` or `until` earlier than `since`; `400` non-integer `limit` |
-| POST | `/v1/breaker/reset` | `200 {"reset":["upstream",...]}` | `400` bad JSON |
+| GET | `/v1/config` | `200` sanitized config (never any secret or hash) | `401` missing/unknown/mismatched/disabled/expired key, `403` `admin scope is missing` / `admin tenant mismatch` (global op needs a `tenant: "*"` key) |
+| POST | `/v1/config/reload` | `200 {"reloaded","revision","ready","error"}` | same `401`; `403` scope / `admin tenant mismatch` (needs a `tenant: "*"` key) |
+| POST | `/v1/keys` | `201 {"key_id","tenant","scopes","secret_sha256","enabled","expires_at_ms","secret"}` (secret returned once) | same `401`; `403` scope / `admin tenant mismatch`; `400` bad JSON / missing tenant / invalid `enabled` or `expires_at_ms` / invalid `admin_auth`, `409` duplicate key id |
+| POST | `/v1/keys/{key_id}/rotate` | `200` same fields as `POST /v1/keys` with the new `secret` (returned once) | same `401`; `403` scope / `admin tenant mismatch` (only the key's owner or a `tenant: "*"` key); `400` empty key id / non-object or malformed body, `404` unknown key id |
+| POST | `/v1/quota/policies` | `201` policy object (echoes `partition_by`) | same `401`; `403` scope / `admin tenant mismatch`; `400` invalid policy / `partition_by`, `409` duplicate id |
+| GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | same `401`; `403` scope / `admin tenant mismatch`; `400` non-integer `since` |
+| GET | `/v1/audit?tenant=&limit=&request_id=&trace_id=&route_id=&status=&since=&until=` | `200 {"tenant","count","entries"}` | same `401`; `403` scope / `admin tenant mismatch`; `400 {"error":"invalid audit query","parameter",...}` for a malformed `trace_id` (not 32 lowercase hex), `status` (not a 100-599 decimal integer), non-integer `since`/`until` or `until` earlier than `since`; `400` non-integer `limit` |
+| POST | `/v1/breaker/reset` | `200 {"reset":["upstream",...]}` | same `401`; `403` scope / `admin tenant mismatch` (needs a `tenant: "*"` key); `400` bad JSON |
 | * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition), `401` missing/unknown/disabled/expired key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict (finished or in-flight response with a different body), `425` same idempotency scope still in progress with the same body, `429` quota exceeded, `502` upstream error, `503` breaker open |
 
 A `/gw/{path}` prefix on the proxy surface is stripped before matching upstreams,
@@ -647,6 +653,72 @@ rejected). Matching records keep their append order and `limit` keeps only the
 last ones; an empty result is still `200` with `count: 0`. Querying is
 read-only: it never writes the audit or usage files, reloads the config,
 clears state or calls an upstream.
+
+## Admin surface authentication
+
+The root document may declare an `admin_auth` policy that protects the `/v1`
+admin commands. `/healthz`, the proxy surface and the CLI (`usage`, `audit`,
+`route-add`, `key-add`, `key-rotate`, `quota-set`) never consult it.
+
+```json
+"admin_auth": {"enabled": true,
+               "read_scopes": ["admin"],
+               "write_scopes": ["admin"]}
+```
+
+* `enabled` defaults to `false`; while the section is absent or disabled the
+  admin commands keep their historical open behaviour.
+* `read_scopes` and `write_scopes` each default to `["admin"]` when omitted.
+
+The section is validated exactly like every other config field, at load, in an
+admin write and on hot reload: a `null` or non-object value, an extra field, a
+non-boolean `enabled`, or a scope list that is `null`, not an array, empty, or
+carries a non-string or empty-string entry all fail with the single fixed
+message `admin_auth configuration is invalid` (`GatewayError`, `400` on the
+HTTP surface). Such a document is never adopted, so the revision, config,
+quota buckets, breakers and idempotency state are untouched.
+
+When enabled, every protected request first resolves a key through the same
+credential machinery as the proxy: `Authorization: Bearer <secret>` or
+`X-Api-Key-Secret: <secret>`, with an optional `X-Api-Key: <key_id>` that must
+match the secret. A missing, unknown, id-mismatched, disabled or expired key is
+`401` with the same fixed reason strings (`missing api key`, `unknown api key`,
+`api key id does not match the presented secret`, `api key disabled`,
+`api key expired`), validity being judged at the request start time. Every
+error body keeps `error` and `request_id`. Authentication and authorisation run
+before the request body is parsed and before anything is mutated, so a rejected
+request never changes the revision, config, quota buckets, breakers or
+idempotency state.
+
+* **Reads** — `GET /v1/config`, `GET /v1/quota/usage`, `GET /v1/audit` —
+  require every scope in `read_scopes`.
+* **Writes** — the `/v1` write commands (`/v1/keys`, key rotation,
+  `/v1/quota/policies`, `/v1/config/reload`, `/v1/breaker/reset`) — require
+  every scope in `write_scopes`.
+* A key holding the `*` scope satisfies any scope requirement. An
+  insufficient scope set is `403 {"error":"admin scope is missing",
+  "request_id":...}`.
+
+Tenant rules on top of the scope check:
+
+* A read query without an explicit `tenant` defaults to the authenticated
+  key's tenant; an explicit `tenant` must equal that tenant. A key whose tenant
+  is `*` may omit the parameter (all tenants) or name any tenant. Any other
+  mismatch is `403 {"error":"admin tenant mismatch", "request_id":...}`.
+* Creating a key or a quota policy requires the object's `tenant` to equal the
+  authenticated key's tenant; a `tenant: "*"` key may create for any tenant.
+  Key rotation is owner scoped: only the target key's owner or a `tenant: "*"`
+  key may rotate it (an unknown key id is still `404`).
+* Global operations — `GET /v1/config`, `POST /v1/config/reload` and
+  `POST /v1/breaker/reset` — are allowed only for a key whose tenant is `*`.
+
+A valid hot reload applies the new policy to later requests only; in-flight
+requests keep the credentials and policy they started with. Disabling the
+policy or loading an invalid update keeps the previous configuration and its
+revision, quota buckets, breaker state and idempotency state (an invalid reload
+reports through the usual `{"reloaded": false, "ready": false, "error":
+"admin_auth configuration is invalid"}`). `GET /v1/config` echoes
+`admin_auth` only when the document declares it.
 
 ## Upstreams
 

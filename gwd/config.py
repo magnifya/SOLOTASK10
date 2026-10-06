@@ -468,11 +468,70 @@ class QuotaPolicy:
         return out
 
 
+ADMIN_AUTH_ERROR = "admin_auth configuration is invalid"
+ADMIN_AUTH_FIELDS = ("enabled", "read_scopes", "write_scopes")
+
+
+@dataclass
+class AdminAuth:
+    """Root-level ``admin_auth`` policy protecting the ``/v1`` admin surface.
+
+    ``enabled`` defaults to false; each scope list defaults to ``["admin"]``
+    when the field is omitted. A key holding the ``*`` scope satisfies any
+    requirement. The policy is hot-reloaded like every other root section, but
+    a malformed one is always rejected with one fixed message so an operator
+    never has to guess which member failed.
+    """
+
+    enabled: bool = False
+    read_scopes: List[str] = field(default_factory=lambda: ["admin"])
+    write_scopes: List[str] = field(default_factory=lambda: ["admin"])
+
+    @classmethod
+    def from_dict(cls, data: Any) -> "AdminAuth":
+        # A null, a non-object, any extra member, a non-boolean ``enabled`` and
+        # a scope list that is missing, null, non-array, empty or carrying a
+        # non-string or empty-string entry all collapse to the same fixed
+        # message -- at load, on write and on hot reload alike.
+        if not isinstance(data, dict):
+            raise GatewayError(ADMIN_AUTH_ERROR)
+        extra = sorted(set(data) - set(ADMIN_AUTH_FIELDS))
+        if extra:
+            raise GatewayError(ADMIN_AUTH_ERROR)
+        if "enabled" in data and not isinstance(data["enabled"], bool):
+            raise GatewayError(ADMIN_AUTH_ERROR)
+
+        def scopes(name: str) -> List[str]:
+            if name not in data:
+                return ["admin"]
+            raw = data[name]
+            if not isinstance(raw, list) or not raw:
+                raise GatewayError(ADMIN_AUTH_ERROR)
+            if any(not isinstance(item, str) or not item for item in raw):
+                raise GatewayError(ADMIN_AUTH_ERROR)
+            return list(raw)
+
+        return cls(enabled=data.get("enabled", False),
+                   read_scopes=scopes("read_scopes"),
+                   write_scopes=scopes("write_scopes"))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"enabled": self.enabled, "read_scopes": list(self.read_scopes),
+                "write_scopes": list(self.write_scopes)}
+
+    def read_satisfied_by(self, key: ApiKey) -> bool:
+        return ANY_SCOPE in key.scopes or set(self.read_scopes).issubset(set(key.scopes))
+
+    def write_satisfied_by(self, key: ApiKey) -> bool:
+        return ANY_SCOPE in key.scopes or set(self.write_scopes).issubset(set(key.scopes))
+
+
 @dataclass
 class GatewayConfig:
     routes: List[Route] = field(default_factory=list)
     keys: List[ApiKey] = field(default_factory=list)
     policies: List[QuotaPolicy] = field(default_factory=list)
+    admin_auth: Optional[AdminAuth] = None
     revision: int = 0
 
     def matching_routes(self, method: str, path: str, tenant: Optional[str]) -> List[Route]:
@@ -485,9 +544,14 @@ class GatewayConfig:
         return next((p for p in self.policies if p.id == policy_id), None)
 
     def sanitized(self) -> Dict[str, Any]:
-        return {"revision": self.revision, "routes": [r.to_dict() for r in self.routes],
-                "keys": [k.public() for k in self.keys],
-                "quota_policies": [p.to_dict() for p in self.policies]}
+        out = {"revision": self.revision, "routes": [r.to_dict() for r in self.routes],
+               "keys": [k.public() for k in self.keys],
+               "quota_policies": [p.to_dict() for p in self.policies]}
+        if self.admin_auth is not None:
+            # Echoed exactly as declared only when the document names the
+            # section; configs without it keep the historical output shape.
+            out["admin_auth"] = self.admin_auth.to_dict()
+        return out
 
 
 def _list(raw: Dict[str, Any], key: str) -> List[Any]:
@@ -519,7 +583,8 @@ def parse(raw: Any) -> GatewayConfig:
                 if policy_id not in known:
                     raise GatewayError("route %s: unknown quota policy %r in quota_policies"
                                        % (route.id, policy_id))
-    return GatewayConfig(routes, keys, policies)
+    admin_auth = AdminAuth.from_dict(raw["admin_auth"]) if "admin_auth" in raw else None
+    return GatewayConfig(routes, keys, policies, admin_auth=admin_auth)
 
 
 def load(path: str, revision: int = 0) -> GatewayConfig:
