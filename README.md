@@ -37,6 +37,7 @@ directly, so they work without a running server.
 | `serve --host --port --config` | run the HTTP server |
 | `route-add --file <json>` | append a route object (or array) to the config |
 | `key-add --tenant --scope ...` | create a key, print the plaintext secret once |
+| `key-rotate --key-id <id>` | replace a key's secret, print the new plaintext secret once |
 | `quota-set --file <json>` | append a quota policy (or array) |
 | `call --method --path --tenant --key --idempotency-key` | call a running gateway through the proxy surface |
 | `usage --tenant [--since]` | aggregate the local `usage.jsonl` ledger |
@@ -350,6 +351,38 @@ An invalid reload keeps the last valid configuration with the usual `ready` /
 `last_error` feedback. Documents written before these fields existed load as
 enabled and non-expiring.
 
+## Key rotation
+
+A leaked key can be rotated in place instead of deleted and recreated:
+`Gateway.rotate_key(key_id)`, the `key-rotate --key-id <id>` CLI command and
+`POST /v1/keys/{key_id}/rotate` all replace **only** the key's
+`secret_sha256`. The `key_id`, `tenant`, `scopes`, `enabled` and
+`expires_at_ms` fields survive verbatim, so the tenant and its authorisation
+relationships are preserved and a disabled or expired key rotates into a new
+secret that stays invalid until `enabled` / `expires_at_ms` are changed
+through the usual hot reload — after which only the new secret works.
+
+The success response echoes the same fields as `key-add` (`key_id`, `tenant`,
+`scopes`, `secret_sha256`, `enabled`, `expires_at_ms`) plus the new plaintext
+`secret`, which is returned exactly once; the config file stores only the
+hash and `GET /v1/config` never exposes it. The HTTP endpoint accepts an
+empty body or any JSON object; an empty `key_id`, a non-object body or
+malformed JSON is `400 {"error": "invalid key rotation request"}` and an
+unknown `key_id` is `404 {"error": "api key not found"}`. A failed rotation
+writes nothing and advances neither the config nor the revision.
+
+The new secret authenticates (`Authorization: Bearer` or `X-Api-Key-Secret`)
+from the next request; the old secret fails credential resolution, so
+authenticated routes and key-partition quota checks answer `401` from the
+next request on, while anonymous routes without a key partition keep
+treating the request as keyless and a mismatched `X-Api-Key` is rejected by
+the usual rules. Requests already inside the pipeline keep the key object
+they resolved at their start. Rotation resets nothing at runtime: quota
+buckets, breaker states, the idempotency cache and the audit trail all carry
+over, and an idempotent replay on an authenticated or key-partitioned route
+still passes authentication and quota first, so the old secret cannot ride a
+cached response past the `401`.
+
 ## Rate limit algorithms
 
 All three are driven purely by the injected `now_ms` and return
@@ -589,6 +622,7 @@ are unauthenticated in this skeleton - front them with your own auth in producti
 | GET | `/v1/config` | `200` sanitized config (never any secret or hash) | - |
 | POST | `/v1/config/reload` | `200 {"reloaded","revision","ready","error"}` | - |
 | POST | `/v1/keys` | `201 {"key_id","tenant","scopes","secret_sha256","enabled","expires_at_ms","secret"}` (secret returned once) | `400` bad JSON / missing tenant / invalid `enabled` or `expires_at_ms`, `409` duplicate key id |
+| POST | `/v1/keys/{key_id}/rotate` | `200` same fields as key creation plus the new `secret` (returned once) | `400` invalid key rotation request, `404` api key not found |
 | POST | `/v1/quota/policies` | `201` policy object (echoes `partition_by`) | `400` invalid policy / `partition_by`, `409` duplicate id |
 | GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | `400` non-integer `since` |
 | GET | `/v1/audit?tenant=&limit=` | `200 {"tenant","count","entries"}` | `400` non-integer `limit` |
@@ -616,6 +650,6 @@ gwd/breaker.py     circuit breaker state machine, retry policy
 gwd/gateway.py     the request pipeline
 gwd/upstream.py    upstream registry, stdlib HTTP client, echo upstream
 gwd/http_app.py    ThreadingHTTPServer, admin surface, proxy surface
-gwd/cli.py         serve, route-add, key-add, quota-set, call, usage, audit
+gwd/cli.py         serve, route-add, key-add, key-rotate, quota-set, call, usage, audit
 tests/             unittest suites for limits, breaker, gateway and HTTP
 ```

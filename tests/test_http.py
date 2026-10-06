@@ -137,6 +137,67 @@ class HttpTest(unittest.TestCase):
         status, _, config = self.json_request("GET", "/v1/config")
         self.assertEqual(len(config["keys"]), 2)  # k-http plus the disabled one
 
+    def test_key_rotation_through_http(self):
+        status, _, payload = self.json_request("POST", "/v1/keys/k-http/rotate")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["key_id"], "k-http")
+        self.assertEqual(payload["tenant"], "acme")
+        self.assertEqual(payload["scopes"], ["read"])
+        self.assertTrue(payload["enabled"])
+        self.assertIsNone(payload["expires_at_ms"])
+        self.assertEqual(payload["secret_sha256"], sha(payload["secret"]))
+        self.assertNotEqual(payload["secret_sha256"], sha(SECRET))
+        # GET /v1/config still never exposes the hash
+        status, _, config = self.json_request("GET", "/v1/config")
+        self.assertNotIn("secret_sha256", json.dumps(config))
+        # the new secret works immediately, the old one is rejected
+        status, _, reply = self.json_request(
+            "GET", "/api/items", headers={"authorization": "Bearer " + payload["secret"]})
+        self.assertEqual(status, 200)
+        self.assertEqual(reply["path"], "/api/items")
+        status, _, reply = self.json_request(
+            "GET", "/api/items", headers={"x-api-key-secret": payload["secret"]})
+        self.assertEqual(status, 200)
+        status, _, reply = self.json_request(
+            "GET", "/api/items", headers={"authorization": "Bearer " + SECRET})
+        self.assertEqual(status, 401)
+        self.assertEqual(reply["error"], "unknown api key")
+
+    def test_key_rotation_accepts_a_json_object_body(self):
+        status, _, payload = self.json_request("POST", "/v1/keys/k-http/rotate",
+                                               {"reason": "leaked"})
+        self.assertEqual(status, 200)
+        self.assertIn("secret", payload)
+
+    def test_key_rotation_validation(self):
+        revision = self.gateway.store.revision
+        status, _, reply = self.json_request("POST", "/v1/keys/k-missing/rotate")
+        self.assertEqual(status, 404)
+        self.assertEqual(reply["error"], "api key not found")
+        self.assertIn("request_id", reply)
+        status, _, reply = self.json_request("POST", "/v1/keys//rotate")
+        self.assertEqual(status, 400)
+        self.assertEqual(reply["error"], "invalid key rotation request")
+        for body in ([1], "x", 1, True):
+            status, _, reply = self.json_request("POST", "/v1/keys/k-http/rotate", body)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(reply["error"], "invalid key rotation request")
+        # malformed JSON is also a 400
+        request = urllib.request.Request(self.base + "/v1/keys/k-http/rotate",
+                                         data=b"{not json", method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                status, text = response.status, response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            status, text = exc.code, exc.read().decode("utf-8")
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(text)["error"], "invalid key rotation request")
+        # nothing changed: revision and the old secret are intact
+        self.assertEqual(self.gateway.store.revision, revision)
+        status, _, reply = self.json_request(
+            "GET", "/api/items", headers={"authorization": "Bearer " + SECRET})
+        self.assertEqual(status, 200)
+
     def test_quota_policy_creation_through_http(self):
         policy = {"id": "p-new", "tenant": "acme", "algorithm": "leaky-bucket",
                   "limit": 5, "window_ms": 1000}

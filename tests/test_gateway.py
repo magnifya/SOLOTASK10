@@ -1130,6 +1130,111 @@ class MutationTest(unittest.TestCase):
         with self.assertRaises(GatewayError):
             gateway.add_key("acme", ["read"])
 
+    def test_rotate_key_replaces_only_the_secret(self):
+        revision = self.gateway.store.revision
+        rotated = self.gateway.rotate_key("k-read")
+        self.assertEqual(self.gateway.store.revision, revision + 1)
+        self.assertEqual(rotated["key_id"], "k-read")
+        self.assertEqual(rotated["tenant"], "acme")
+        self.assertEqual(rotated["scopes"], ["read"])
+        self.assertTrue(rotated["enabled"])
+        self.assertIsNone(rotated["expires_at_ms"])
+        self.assertEqual(rotated["secret_sha256"], sha(rotated["secret"]))
+        self.assertNotEqual(rotated["secret_sha256"], sha(SECRET_READ))
+        with open(self.path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+        self.assertNotIn(rotated["secret"], raw)
+        self.assertIn(sha(rotated["secret"]), raw)
+        self.assertNotIn(sha(SECRET_READ), raw)
+        self.assertNotIn("secret_sha256", json.dumps(self.gateway.sanitized_config()))
+        # the new secret authenticates immediately through both credential headers
+        for headers in ({"authorization": "Bearer " + rotated["secret"]},
+                        {"x-api-key-secret": rotated["secret"]}):
+            response = self.gateway.handle("acme", "GET", "/api/x", headers, "", now_ms=0)
+            self.assertEqual(response["status"], 200, headers)
+        # the old secret is rejected from the next request on
+        response = self.gateway.handle("acme", "GET", "/api/x",
+                                       {"authorization": "Bearer " + SECRET_READ}, "", now_ms=0)
+        self.assertEqual(response["status"], 401)
+        self.assertEqual(json.loads(response["body"])["error"], "unknown api key")
+        # the other keys are untouched
+        response = self.gateway.handle("globex", "POST", "/open/x",
+                                       {"authorization": "Bearer " + SECRET_GLOBEX}, "", now_ms=0)
+        self.assertEqual(response["status"], 200)
+
+    def test_rotate_key_keeps_quota_bucket_state(self):
+        headers = {"authorization": "Bearer " + SECRET_READ}
+        for _ in range(2):  # p-fast allows exactly two requests per window
+            response = self.gateway.handle("acme", "GET", "/api/x", headers, "", now_ms=0)
+            self.assertEqual(response["status"], 200)
+        rotated = self.gateway.rotate_key("k-read")
+        response = self.gateway.handle("acme", "GET", "/api/x",
+                                       {"authorization": "Bearer " + rotated["secret"]},
+                                       "", now_ms=1)
+        self.assertEqual(response["status"], 429)  # the bucket was not reset
+
+    def test_rotate_key_rejects_unknown_and_invalid_ids_without_changing_state(self):
+        before = json.dumps(self.gateway.sanitized_config(), sort_keys=True)
+        revision = self.gateway.store.revision
+        with self.assertRaises(GatewayError) as caught:
+            self.gateway.rotate_key("k-missing")
+        self.assertEqual(caught.exception.status, 404)
+        self.assertEqual(caught.exception.message, "api key not found")
+        for bad in ("", None, 7, ["k-read"]):
+            with self.assertRaises(GatewayError, msg=repr(bad)) as caught:
+                self.gateway.rotate_key(bad)
+            self.assertEqual(caught.exception.status, 400)
+            self.assertEqual(caught.exception.message, "invalid key rotation request")
+        self.assertEqual(json.dumps(self.gateway.sanitized_config(), sort_keys=True), before)
+        self.assertEqual(self.gateway.store.revision, revision)
+        response = self.gateway.handle("acme", "GET", "/api/x",
+                                       {"authorization": "Bearer " + SECRET_READ}, "", now_ms=0)
+        self.assertEqual(response["status"], 200)  # the old secret still works
+
+    def test_rotate_disabled_key_keeps_it_disabled_until_reenabled(self):
+        created = self.gateway.add_key("acme", ["read"], key_id="k-off", enabled=False)
+        rotated = self.gateway.rotate_key("k-off")
+        self.assertFalse(rotated["enabled"])
+        response = self.gateway.handle("acme", "GET", "/api/x",
+                                       {"authorization": "Bearer " + rotated["secret"]},
+                                       "", now_ms=0)
+        self.assertEqual(response["status"], 401)
+        self.assertEqual(json.loads(response["body"])["error"], "api key disabled")
+        # re-enable through the config file: only the new secret works
+        with open(self.path, "r", encoding="utf-8") as handle:
+            doc = json.load(handle)
+        for entry in doc["keys"]:
+            if entry["key_id"] == "k-off":
+                entry["enabled"] = True
+        write_config(self.path, doc)
+        self.assertTrue(self.gateway.reload_config())
+        response = self.gateway.handle("acme", "GET", "/api/x",
+                                       {"authorization": "Bearer " + rotated["secret"]},
+                                       "", now_ms=0)
+        self.assertEqual(response["status"], 200)
+        response = self.gateway.handle("acme", "GET", "/api/x",
+                                       {"authorization": "Bearer " + created["secret"]},
+                                       "", now_ms=0)
+        self.assertEqual(response["status"], 401)
+
+    def test_rotate_key_keeps_idempotency_cache_and_blocks_old_secret_replay(self):
+        headers = {"authorization": "Bearer " + SECRET_READ, "x-idempotency-key": "idem-1"}
+        first = self.gateway.handle("acme", "GET", "/api/x", headers, "", now_ms=0)
+        self.assertEqual(first["status"], 200)
+        rotated = self.gateway.rotate_key("k-read")
+        # the old secret fails authentication before the cache is consulted
+        stale = self.gateway.handle("acme", "GET", "/api/x",
+                                    {"authorization": "Bearer " + SECRET_READ,
+                                     "x-idempotency-key": "idem-1"}, "", now_ms=1)
+        self.assertEqual(stale["status"], 401)
+        # the new secret still replays the cached response
+        replay = self.gateway.handle("acme", "GET", "/api/x",
+                                     {"authorization": "Bearer " + rotated["secret"],
+                                      "x-idempotency-key": "idem-1"}, "", now_ms=2)
+        self.assertEqual(replay["status"], 200)
+        self.assertEqual(replay["headers"].get("X-Idempotent-Replay"), "true")
+        self.assertEqual(replay["body"], first["body"])
+
 
 if __name__ == "__main__":
     unittest.main()

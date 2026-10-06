@@ -1,4 +1,4 @@
-"""Command line interface: serve, route-add, key-add, quota-set, call, usage, audit."""
+"""Command line interface: serve, route-add, key-add, key-rotate, quota-set, call, usage, audit."""
 
 from __future__ import annotations
 
@@ -67,6 +67,11 @@ def cmd_key_add(args: argparse.Namespace) -> Dict[str, Any]:
     gateway = Gateway(config_path=args.config, data_dir=args.data_dir)
     scopes: List[str] = args.scopes or [ANY_SCOPE]
     return gateway.add_key(args.tenant, scopes, args.key_id)
+
+
+def cmd_key_rotate(args: argparse.Namespace) -> Dict[str, Any]:
+    gateway = Gateway(config_path=args.config, data_dir=args.data_dir)
+    return gateway.rotate_key(args.key_id)
 
 
 def cmd_quota_set(args: argparse.Namespace) -> Dict[str, Any]:
@@ -144,6 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
     key_add.add_argument("--key-id")
     key_add.add_argument("--config", default="./config.json")
     key_add.set_defaults(func=cmd_key_add)
+
+    key_rotate = sub.add_parser("key-rotate",
+                                help="replace an API key's secret; prints the new secret once")
+    key_rotate.add_argument("--key-id", required=True)
+    key_rotate.add_argument("--config", default="./config.json")
+    key_rotate.set_defaults(func=cmd_key_rotate)
 
     quota_set = sub.add_parser("quota-set", help="append a quota policy from a JSON file")
     quota_set.add_argument("--file", required=True)

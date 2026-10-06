@@ -101,6 +101,18 @@ class GatewayHandler(BaseHTTPRequestHandler):
             out = gateway.add_key(payload.get("tenant") or "", payload.get("scopes"),
                                   payload.get("key_id"), **extras)
             self._json(201, out, request_id)
+        elif target.startswith("/v1/keys/") and target.endswith("/rotate"):
+            if self.command != "POST":
+                return False
+            key_id = urllib.parse.unquote(target[len("/v1/keys/"):-len("/rotate")])
+            if raw.strip():
+                try:
+                    payload = json.loads(raw)
+                except ValueError:
+                    raise GatewayError("invalid key rotation request", 400)
+                if not isinstance(payload, dict):
+                    raise GatewayError("invalid key rotation request", 400)
+            self._json(200, gateway.rotate_key(key_id), request_id)
         elif target == "/v1/quota/policies":
             self._json(201, gateway.add_policy(_json_body(raw)), request_id)
         elif target == "/v1/quota/usage":
