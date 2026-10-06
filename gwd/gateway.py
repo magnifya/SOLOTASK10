@@ -392,6 +392,11 @@ class Gateway:
         # keeps this local route object, so in-flight requests are always billed
         # at the cost they started with.
         cost = int(route.quota_cost)
+        # The retry budget is likewise fixed once the route is selected: a
+        # route with an explicit retry block uses its own policy, every other
+        # route keeps the gateway-wide one, and a hot reload mid-request never
+        # changes what this request snapshot here.
+        retry_policy = route.retry if route.retry is not None else self.retry_policy
 
         # 2. authentication and authorisation
         if route.auth_required:
@@ -573,7 +578,7 @@ class Gateway:
                         rejected_state = breaker.state
                     continue
                 attempt = 0
-                while attempt < self.retry_policy.max_attempts:
+                while attempt < retry_policy.max_attempts:
                     attempt += 1
                     attempts += 1
                     try:
@@ -582,10 +587,10 @@ class Gateway:
                     except UpstreamError:
                         response = None
                         status = TRANSPORT_ERROR
-                    if not self.retry_policy.should_retry(attempt, status):
+                    if not retry_policy.should_retry(attempt, status):
                         break
                     if self.sleep_fn is not None:
-                        self.sleep_fn(self.retry_policy.delay_ms(attempt))
+                        self.sleep_fn(retry_policy.delay_ms(attempt))
                 breaker.record(status != TRANSPORT_ERROR and status < 500, now)
                 if attempt:
                     upstream_name = name

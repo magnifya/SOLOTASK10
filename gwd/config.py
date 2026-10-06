@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+from .breaker import RetryPolicy
+
 ALGORITHMS = ("token-bucket", "leaky-bucket", "sliding-window")
 PARTITION_MODES = ("policy", "tenant", "key")
 ANY_TENANT = "*"
@@ -109,6 +111,36 @@ def _quota_cost(data: Dict[str, Any], where: str) -> int:
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
         raise GatewayError("%s: quota_cost must be a positive integer" % where)
     return int(raw)
+
+
+RETRY_FIELDS = ("max_attempts", "base_ms", "max_ms")
+RETRY_INVALID = "route retry policy is invalid"
+
+
+def _retry_policy(data: Dict[str, Any]) -> Optional[RetryPolicy]:
+    """Optional per-route retry budget: omitted means the route keeps the
+    gateway-wide :class:`RetryPolicy`; when present it must be an object with
+    exactly ``max_attempts``, ``base_ms`` and ``max_ms`` -- all integers, never
+    booleans or null -- with ``max_attempts >= 1``, ``base_ms >= 0`` and
+    ``max_ms >= 1`` and no smaller than ``base_ms``. Any other shape, a
+    missing or extra member, or an out-of-range value is rejected with the
+    fixed ``route retry policy is invalid`` message."""
+    if "retry" not in data:
+        return None
+    raw = data["retry"]
+    if not isinstance(raw, dict) or set(raw) != set(RETRY_FIELDS):
+        raise GatewayError(RETRY_INVALID)
+    values = {}
+    for name in RETRY_FIELDS:
+        value = raw[name]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise GatewayError(RETRY_INVALID)
+        values[name] = value
+    if (values["max_attempts"] < 1 or values["base_ms"] < 0
+            or values["max_ms"] < 1 or values["max_ms"] < values["base_ms"]):
+        raise GatewayError(RETRY_INVALID)
+    return RetryPolicy(max_attempts=values["max_attempts"],
+                       base_ms=values["base_ms"], max_ms=values["max_ms"])
 
 
 def _match_headers(match: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -220,6 +252,7 @@ class Route:
     fallback_upstreams: List[str] = field(default_factory=list)
     version: Optional[str] = None
     match_headers: Optional[Dict[str, str]] = None
+    retry: Optional[RetryPolicy] = None
 
     @classmethod
     def from_dict(cls, data: Any, where: str = "route") -> "Route":
@@ -259,7 +292,8 @@ class Route:
                    timeout_ms=timeout_ms, scopes=_str_list(data, "scopes", where),
                    fallback_upstreams=_fallback_list(data, "fallback_upstreams", where, upstream),
                    version=_version_value(data, where),
-                   match_headers=_match_headers(match))
+                   match_headers=_match_headers(match),
+                   retry=_retry_policy(data))
 
     def to_dict(self) -> Dict[str, Any]:
         transform: Dict[str, Any] = {"request_headers": dict(self.request_headers),
@@ -285,6 +319,13 @@ class Route:
             out["quota_policies"] = list(self.quota_policies)
         if self.version is not None:
             out["version"] = self.version
+        if self.retry is not None:
+            # Echoed back exactly as declared, so GET /v1/config and a
+            # route-add round trip show the explicit per-route budget; routes
+            # without a retry block keep the historical shape.
+            out["retry"] = {"max_attempts": self.retry.max_attempts,
+                            "base_ms": self.retry.base_ms,
+                            "max_ms": self.retry.max_ms}
         return out
 
     def matches(self, method: str, path: str, tenant: Optional[str]) -> bool:
