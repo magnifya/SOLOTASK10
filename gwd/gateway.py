@@ -209,6 +209,34 @@ class Gateway:
         out["secret"] = secret
         return out
 
+    def rotate_key(self, key_id: Any) -> Dict[str, Any]:
+        """Replace only the secret of an existing key; the new plaintext is
+        returned exactly once.
+
+        ``key_id``, ``tenant``, ``scopes``, ``enabled`` and ``expires_at_ms``
+        are preserved verbatim -- a disabled or expired key may be rotated but
+        stays disabled or expired until it is re-enabled or re-dated, and only
+        the new secret works from then on. The mutation rides the usual
+        ``_mutate`` path, so the revision advances exactly once on success and
+        a failure writes nothing and advances nothing; quota buckets, breaker
+        state, the idempotency cache and the audit trail are never reset.
+        """
+        if not isinstance(key_id, str) or not key_id:
+            raise GatewayError("invalid key rotation request", 400)
+        secret = secrets.token_urlsafe(24)
+        digest = sha256_hex(secret)
+        def mutate(document: Dict[str, Any]) -> None:
+            for entry in document["keys"]:
+                if entry.get("key_id") == key_id:
+                    entry["secret_sha256"] = digest
+                    return
+            raise GatewayError("api key not found", 404)
+        self._mutate(mutate)
+        key = self.config.key(key_id)
+        out = key.to_dict()          # the plaintext secret is returned exactly once
+        out["secret"] = secret
+        return out
+
     def add_policy(self, raw: Any) -> Dict[str, Any]:
         items = raw if isinstance(raw, list) else [raw]
         policies = [QuotaPolicy.from_dict(item, "quota policy") for item in items]

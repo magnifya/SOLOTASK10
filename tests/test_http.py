@@ -137,6 +137,106 @@ class HttpTest(unittest.TestCase):
         status, _, config = self.json_request("GET", "/v1/config")
         self.assertEqual(len(config["keys"]), 2)  # k-http plus the disabled one
 
+    def raw_request(self, method, path, text, headers=None):
+        request = urllib.request.Request(self.base + path, data=text.encode("utf-8"),
+                                         method=method, headers=headers or {})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read().decode("utf-8"))
+
+    def test_key_rotation_replaces_only_the_secret(self):
+        status, _, payload = self.json_request("POST", "/v1/keys/k-http/rotate")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["key_id"], "k-http")
+        self.assertEqual(payload["tenant"], "acme")
+        self.assertEqual(payload["scopes"], ["read"])
+        self.assertTrue(payload["enabled"])
+        self.assertIsNone(payload["expires_at_ms"])
+        self.assertIn("secret", payload)
+        self.assertEqual(payload["secret_sha256"], sha(payload["secret"]))
+        # the file keeps only the new hash; GET /v1/config exposes neither
+        with open(self.config_path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+        self.assertNotIn(payload["secret"], raw)
+        self.assertIn(sha(payload["secret"]), raw)
+        self.assertNotIn(sha(SECRET), raw)
+        status, _, config = self.json_request("GET", "/v1/config")
+        self.assertNotIn("secret_sha256", json.dumps(config))
+        # the new secret works immediately, the old one is 401 from the next request
+        status, _, reply = self.json_request(
+            "GET", "/api/items",
+            headers={"authorization": "Bearer " + payload["secret"]})
+        self.assertEqual(status, 200)
+        status, _, reply = self.json_request(
+            "GET", "/api/items", headers={"x-api-key-secret": payload["secret"]})
+        self.assertEqual(status, 200)
+        status, _, reply = self.json_request(
+            "GET", "/api/items", headers={"authorization": "Bearer " + SECRET})
+        self.assertEqual(status, 401)
+        self.assertEqual(reply["error"], "unknown api key")
+        # a stated X-Api-Key that does not match the secret is still rejected
+        status, _, reply = self.json_request(
+            "GET", "/api/items",
+            headers={"authorization": "Bearer " + payload["secret"],
+                     "x-api-key": "k-other"})
+        self.assertEqual(status, 401)
+        self.assertEqual(reply["error"], "api key id does not match the presented secret")
+
+    def test_key_rotation_accepts_empty_or_object_body_only(self):
+        for body in ("", "{}"):
+            status, reply = self.raw_request("POST", "/v1/keys/k-http/rotate", body)
+            self.assertEqual(status, 200, body)
+            self.assertIn("secret", reply)
+        status, reply = self.raw_request("POST", "/v1/keys/k-http/rotate", '{"note": "x"}')
+        self.assertEqual(status, 200)
+        revision = self.gateway.store.revision
+        for body in ("[1]", '"x"', "1", "null", "{not json"):
+            status, reply = self.raw_request("POST", "/v1/keys/k-http/rotate", body)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(reply["error"], "invalid key rotation request")
+            self.assertIn("request_id", reply)
+        self.assertEqual(self.gateway.store.revision, revision)
+
+    def test_key_rotation_unknown_and_empty_key_id(self):
+        revision = self.gateway.store.revision
+        status, reply = self.raw_request("POST", "/v1/keys/k-nope/rotate", "")
+        self.assertEqual(status, 404)
+        self.assertEqual(reply["error"], "api key not found")
+        self.assertIn("request_id", reply)
+        for path in ("/v1/keys//rotate", "/v1/keys/rotate"):
+            status, reply = self.raw_request("POST", path, "")
+            self.assertEqual(status, 400, path)
+            self.assertEqual(reply["error"], "invalid key rotation request")
+        self.assertEqual(self.gateway.store.revision, revision)
+        status, _, config = self.json_request("GET", "/v1/config")
+        self.assertEqual({k["key_id"] for k in config["keys"]}, {"k-http"})
+
+    def test_key_rotation_of_disabled_key_keeps_validity(self):
+        status, _, created = self.json_request(
+            "POST", "/v1/keys", {"tenant": "acme", "scopes": ["read"], "enabled": False})
+        self.assertEqual(status, 201)
+        status, _, rotated = self.json_request(
+            "POST", "/v1/keys/%s/rotate" % created["key_id"], {"any": "thing"})
+        self.assertEqual(status, 200)
+        self.assertFalse(rotated["enabled"])
+        status, _, reply = self.json_request(
+            "GET", "/api/items",
+            headers={"authorization": "Bearer " + rotated["secret"]})
+        self.assertEqual(status, 401)
+        self.assertEqual(reply["error"], "api key disabled")
+        status, _, reply = self.json_request(
+            "GET", "/api/items",
+            headers={"authorization": "Bearer " + created["secret"]})
+        self.assertEqual(status, 401)
+        self.assertEqual(reply["error"], "unknown api key")
+
+    def test_key_rotation_get_falls_through_to_the_proxy(self):
+        status, _, payload = self.json_request("GET", "/v1/keys/k-http/rotate")
+        self.assertEqual(status, 404)
+        self.assertIn("no route", payload["error"])
+
     def test_quota_policy_creation_through_http(self):
         policy = {"id": "p-new", "tenant": "acme", "algorithm": "leaky-bucket",
                   "limit": 5, "window_ms": 1000}

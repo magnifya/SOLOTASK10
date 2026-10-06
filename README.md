@@ -37,6 +37,7 @@ directly, so they work without a running server.
 | `serve --host --port --config` | run the HTTP server |
 | `route-add --file <json>` | append a route object (or array) to the config |
 | `key-add --tenant --scope ...` | create a key, print the plaintext secret once |
+| `key-rotate --key-id` | replace a key's secret, print the new plaintext once |
 | `quota-set --file <json>` | append a quota policy (or array) |
 | `call --method --path --tenant --key --idempotency-key` | call a running gateway through the proxy surface |
 | `usage --tenant [--since]` | aggregate the local `usage.jsonl` ledger |
@@ -350,6 +351,33 @@ An invalid reload keeps the last valid configuration with the usual `ready` /
 `last_error` feedback. Documents written before these fields existed load as
 enabled and non-expiring.
 
+## Key rotation
+
+`POST /v1/keys/{key_id}/rotate` (or `key-rotate --key-id`) replaces a leaked
+secret in place: only `secret_sha256` changes — `key_id`, `tenant`, `scopes`,
+`enabled` and `expires_at_ms` are preserved verbatim, the revision advances
+exactly once, and quota buckets, breaker state, the idempotency cache and the
+audit trail are never reset. The request accepts only an empty body or a JSON
+object (its content is ignored); the success reply carries the same fields as
+`POST /v1/keys` plus the new plaintext `secret`, which is shown exactly once —
+the config file keeps only the hash and `GET /v1/config` exposes neither.
+
+The new secret authenticates immediately as `Authorization: Bearer` or
+`X-Api-Key-Secret`; the old secret resolves as `unknown api key` from the next
+request on authenticated routes and key partitions (401), while anonymous
+routes without a key partition keep treating it as no key at all, and a stated
+`X-Api-Key` that does not match the presented secret is still rejected as
+before. A disabled or expired key may be rotated but keeps its validity — once
+re-enabled or re-dated, only the new secret authenticates. Requests already
+inside the pipeline keep the credentials resolved at their start; idempotent
+replays on authenticated or key-partitioned routes still re-check the secret
+and quota first, so the old secret cannot ride a cached response past the 401.
+
+An unknown `key_id` is `404 {"error": "api key not found"}`; an empty
+`key_id`, a non-object body or malformed JSON is
+`400 {"error": "invalid key rotation request"}` — and a failed rotation writes
+nothing and advances neither the revision nor any runtime state.
+
 ## Rate limit algorithms
 
 All three are driven purely by the injected `now_ms` and return
@@ -589,6 +617,7 @@ are unauthenticated in this skeleton - front them with your own auth in producti
 | GET | `/v1/config` | `200` sanitized config (never any secret or hash) | - |
 | POST | `/v1/config/reload` | `200 {"reloaded","revision","ready","error"}` | - |
 | POST | `/v1/keys` | `201 {"key_id","tenant","scopes","secret_sha256","enabled","expires_at_ms","secret"}` (secret returned once) | `400` bad JSON / missing tenant / invalid `enabled` or `expires_at_ms`, `409` duplicate key id |
+| POST | `/v1/keys/{key_id}/rotate` | `200` same fields as `POST /v1/keys` with the new `secret` (returned once) | `400` empty key id / non-object or malformed body, `404` unknown key id |
 | POST | `/v1/quota/policies` | `201` policy object (echoes `partition_by`) | `400` invalid policy / `partition_by`, `409` duplicate id |
 | GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | `400` non-integer `since` |
 | GET | `/v1/audit?tenant=&limit=` | `200 {"tenant","count","entries"}` | `400` non-integer `limit` |
@@ -616,6 +645,6 @@ gwd/breaker.py     circuit breaker state machine, retry policy
 gwd/gateway.py     the request pipeline
 gwd/upstream.py    upstream registry, stdlib HTTP client, echo upstream
 gwd/http_app.py    ThreadingHTTPServer, admin surface, proxy surface
-gwd/cli.py         serve, route-add, key-add, quota-set, call, usage, audit
+gwd/cli.py         serve, route-add, key-add, key-rotate, quota-set, call, usage, audit
 tests/             unittest suites for limits, breaker, gateway and HTTP
 ```

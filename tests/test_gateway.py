@@ -1130,6 +1130,145 @@ class MutationTest(unittest.TestCase):
         with self.assertRaises(GatewayError):
             gateway.add_key("acme", ["read"])
 
+    @staticmethod
+    def _bearer(secret):
+        return {"authorization": "Bearer " + secret}
+
+    def test_rotate_key_replaces_only_the_secret(self):
+        created = self.gateway.add_key("acme", ["read"], key_id="k-rot",
+                                       enabled=False, expires_at_ms=1000)
+        revision = self.gateway.store.revision
+        rotated = self.gateway.rotate_key("k-rot")
+        # every field but the secret hash is preserved verbatim
+        self.assertEqual(rotated["key_id"], "k-rot")
+        self.assertEqual(rotated["tenant"], "acme")
+        self.assertEqual(rotated["scopes"], ["read"])
+        self.assertFalse(rotated["enabled"])
+        self.assertEqual(rotated["expires_at_ms"], 1000)
+        self.assertNotEqual(rotated["secret"], created["secret"])
+        self.assertEqual(rotated["secret_sha256"], sha(rotated["secret"]))
+        self.assertEqual(self.gateway.store.revision, revision + 1)
+        # the file keeps only the new hash; the sanitized view hides it
+        with open(self.path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+        self.assertNotIn(rotated["secret"], raw)
+        self.assertNotIn(created["secret"], raw)
+        self.assertIn(sha(rotated["secret"]), raw)
+        self.assertNotIn(sha(created["secret"]), raw)
+        keys = {k["key_id"]: k for k in self.gateway.sanitized_config()["keys"]}
+        self.assertNotIn("secret_sha256", keys["k-rot"])
+        self.assertFalse(keys["k-rot"]["enabled"])
+        self.assertEqual(keys["k-rot"]["expires_at_ms"], 1000)
+
+    def test_rotate_key_swaps_the_working_secret_immediately(self):
+        before = self.gateway.handle("acme", "GET", "/api/x", self._bearer(SECRET_READ), "", now_ms=0)
+        self.assertEqual(before["status"], 200)
+        rotated = self.gateway.rotate_key("k-read")
+        old = self.gateway.handle("acme", "GET", "/api/x", self._bearer(SECRET_READ), "", now_ms=1)
+        self.assertEqual(old["status"], 401)
+        self.assertEqual(json.loads(old["body"])["error"], "unknown api key")
+        new = self.gateway.handle("acme", "GET", "/api/x",
+                                  self._bearer(rotated["secret"]), "", now_ms=2)
+        self.assertEqual(new["status"], 200)
+        # X-Api-Key must still match the presented secret's key id
+        headers = self._bearer(rotated["secret"])
+        headers["x-api-key"] = "k-admin"
+        mismatch = self.gateway.handle("acme", "GET", "/api/x", headers, "", now_ms=3)
+        self.assertEqual(mismatch["status"], 401)
+        self.assertEqual(json.loads(mismatch["body"])["error"],
+                         "api key id does not match the presented secret")
+
+    def test_rotate_key_keeps_disabled_validity_until_reenabled(self):
+        created = self.gateway.add_key("acme", ["read"], key_id="k-off", enabled=False)
+        rotated = self.gateway.rotate_key("k-off")
+        self.assertFalse(rotated["enabled"])
+        disabled = self.gateway.handle("acme", "GET", "/api/x",
+                                       self._bearer(rotated["secret"]), "", now_ms=0)
+        self.assertEqual(disabled["status"], 401)
+        self.assertEqual(json.loads(disabled["body"])["error"], "api key disabled")
+        # re-enabling through a hot reload activates only the new secret
+        doc = document()
+        doc["keys"].append({"key_id": "k-off", "tenant": "acme",
+                            "secret_sha256": sha(rotated["secret"]),
+                            "scopes": ["read"], "enabled": True})
+        write_config(self.path, doc)
+        self.assertTrue(self.gateway.reload_config())
+        ok = self.gateway.handle("acme", "GET", "/api/x",
+                                 self._bearer(rotated["secret"]), "", now_ms=1)
+        self.assertEqual(ok["status"], 200)
+        gone = self.gateway.handle("acme", "GET", "/api/x",
+                                   self._bearer(created["secret"]), "", now_ms=2)
+        self.assertEqual(gone["status"], 401)
+        self.assertEqual(json.loads(gone["body"])["error"], "unknown api key")
+
+    def test_rotate_key_preserves_quota_buckets(self):
+        self.gateway.handle("acme", "GET", "/api/x", self._bearer(SECRET_READ), "", now_ms=0)
+        self.gateway.handle("acme", "GET", "/api/x", self._bearer(SECRET_READ), "", now_ms=1)
+        limited = self.gateway.handle("acme", "GET", "/api/x", self._bearer(SECRET_READ), "", now_ms=2)
+        self.assertEqual(limited["status"], 429)
+        rotated = self.gateway.rotate_key("k-read")
+        # the bucket is not reset: the new secret is still over the limit
+        still = self.gateway.handle("acme", "GET", "/api/x",
+                                    self._bearer(rotated["secret"]), "", now_ms=3)
+        self.assertEqual(still["status"], 429)
+
+    def test_rotate_key_failures_change_nothing(self):
+        before = json.dumps(self.gateway.sanitized_config(), sort_keys=True)
+        revision = self.gateway.store.revision
+        with self.assertRaises(GatewayError) as caught:
+            self.gateway.rotate_key("k-nope")
+        self.assertEqual(caught.exception.status, 404)
+        self.assertEqual(caught.exception.message, "api key not found")
+        for bad in ("", None, 7, ["k-read"]):
+            with self.assertRaises(GatewayError, msg=repr(bad)) as caught:
+                self.gateway.rotate_key(bad)
+            self.assertEqual(caught.exception.status, 400)
+            self.assertEqual(caught.exception.message, "invalid key rotation request")
+        self.assertEqual(json.dumps(self.gateway.sanitized_config(), sort_keys=True), before)
+        self.assertEqual(self.gateway.store.revision, revision)
+        with open(self.path, "r", encoding="utf-8") as handle:
+            self.assertNotIn("k-nope", handle.read())
+
+
+class CliRotateTest(unittest.TestCase):
+    def setUp(self):
+        self.gateway, self.root, self.path = make_gateway()
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def test_key_rotate_prints_one_json_line(self):
+        import contextlib
+        import io
+
+        from gwd.cli import main
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main(["--data-dir", os.path.join(self.root, "data"),
+                         "key-rotate", "--key-id", "k-read", "--config", self.path])
+        self.assertEqual(code, 0)
+        lines = out.getvalue().strip().splitlines()
+        self.assertEqual(len(lines), 1)
+        payload = json.loads(lines[0])
+        self.assertEqual(payload["key_id"], "k-read")
+        self.assertEqual(payload["secret_sha256"], sha(payload["secret"]))
+        with open(self.path, "r", encoding="utf-8") as handle:
+            raw = handle.read()
+        self.assertNotIn(payload["secret"], raw)
+        self.assertIn(sha(payload["secret"]), raw)
+
+    def test_key_rotate_errors_print_one_json_line(self):
+        import contextlib
+        import io
+
+        from gwd.cli import main
+        for key_id, message in (("k-nope", "api key not found"),
+                                ("", "invalid key rotation request")):
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = main(["key-rotate", "--key-id", key_id, "--config", self.path])
+            self.assertEqual(code, 1)
+            self.assertEqual(out.getvalue(), "")
+            self.assertEqual(json.loads(err.getvalue())["error"], message)
+
 
 if __name__ == "__main__":
     unittest.main()
