@@ -385,6 +385,48 @@ An unknown `key_id` is `404 {"error": "api key not found"}`; an empty
 `400 {"error": "invalid key rotation request"}` — and a failed rotation writes
 nothing and advances neither the revision nor any runtime state.
 
+## Admin authentication (`admin_auth`)
+
+The root config may declare an optional `admin_auth` block that protects the
+`/v1` admin surface; `/healthz`, the proxy surface and the `usage` / `audit`
+CLI commands are never affected:
+
+```json
+"admin_auth": {"enabled": true, "read_scopes": ["admin-read"], "write_scopes": ["admin"]}
+```
+
+`enabled` defaults to `false` (the historical unauthenticated surface) and
+`read_scopes` / `write_scopes` default to `["admin"]`. The block is validated
+like every other config field: a non-object value, a non-boolean `enabled`, an
+empty array, a non-string or empty scope and any extra field are rejected with
+`admin_auth configuration is invalid` at load, on every config write and on
+hot reload — an invalid reload keeps the previous configuration, revision,
+quota buckets, breaker states and idempotency state. The sanitized
+`GET /v1/config` echoes `admin_auth` only when the document declares it.
+
+When enabled, `GET /v1/config`, `GET /v1/quota/usage` and `GET /v1/audit` are
+read operations requiring every `read_scopes` entry, and the `/v1` write
+endpoints (`/v1/config/reload`, `/v1/keys`, key rotation, `/v1/quota/policies`,
+`/v1/breaker/reset`) require every `write_scopes` entry; a key's `*` scope
+satisfies any requirement. Authentication reuses the proxy credentials —
+`Authorization: Bearer` or `X-Api-Key-Secret`, plus a stated `X-Api-Key` — with
+validity checked at the request start time, so missing, unknown, mismatched,
+disabled and expired secrets keep their usual 401 texts. A scope shortfall is
+`403 {"error": "admin scope is missing", "request_id": ...}`. The check runs
+before any body parsing or mutation, so a rejected call never moves the
+revision, the configuration, quota buckets, breaker state or idempotency
+state.
+
+Tenant rules: read queries default to the authenticated key's tenant and an
+explicit `tenant` must equal it; a key with tenant `*` may omit the tenant or
+name any one. Anything else is `403 {"error": "admin tenant mismatch", ...}`.
+Creating a key or a quota policy requires the new object's tenant to equal the
+caller's (a `*` key may create for any tenant), and rotating a key is confined
+to the caller's tenant the same way. Global operations — `GET /v1/config`,
+`/v1/config/reload` and `/v1/breaker/reset` — are reserved for keys with
+tenant `*`. A valid hot reload applies the policy to later requests only, and
+disabling or removing the block reopens the surface for subsequent requests.
+
 ## Rate limit algorithms
 
 All three are driven purely by the injected `now_ms` and return
@@ -592,7 +634,9 @@ satisfies any requirement. `tenant: "*"` marks a route shared by every tenant.
 `partition_by` defaults to `"policy"` and accepts only `"policy"`, `"tenant"`
 and `"key"` (see [Quota partitions](#quota-partitions)). `fallback_upstreams`
 defaults to `[]` and lists the ordered failover upstreams (see
-[Fallback upstreams](#fallback-upstreams)). `version` is optional; when present
+[Fallback upstreams](#fallback-upstreams)). `admin_auth` is optional and
+protects the `/v1` admin surface when enabled (see
+[Admin authentication](#admin-authentication-admin_auth)). `version` is optional; when present
 it must be a non-empty string and it opts the route into API version filtering
 (see [Request pipeline](#request-pipeline)) — the sanitized `GET /v1/config`
 echoes `version` only on routes that declared it. `quota_cost` is optional,
@@ -616,7 +660,8 @@ and records `last_error`.
 ## HTTP API
 
 Errors are always JSON: `{"error": "...", "request_id": "..."}`. Admin endpoints
-are unauthenticated in this skeleton - front them with your own auth in production.
+are unauthenticated unless the config declares an `admin_auth` policy (see
+[Admin authentication](#admin-authentication-admin_auth)).
 
 | Method | Path | Success | Errors |
 | --- | --- | --- | --- |

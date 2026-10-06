@@ -468,12 +468,65 @@ class QuotaPolicy:
         return out
 
 
+ADMIN_AUTH_FIELDS = ("enabled", "read_scopes", "write_scopes")
+ADMIN_AUTH_ERROR = "admin_auth configuration is invalid"
+
+
+@dataclass
+class AdminAuth:
+    """Hot-reloadable authorization policy for the admin (``/v1``) surface.
+
+    ``enabled`` defaults to ``False`` (the historical unauthenticated admin
+    surface); ``read_scopes`` guard the read endpoints (``GET /v1/config``,
+    ``/v1/quota/usage``, ``/v1/audit``) and ``write_scopes`` the write
+    endpoints, both defaulting to ``["admin"]``. A key satisfies the check
+    only when it holds every required scope (``*`` satisfies any scope).
+    """
+
+    enabled: bool = False
+    read_scopes: List[str] = field(default_factory=lambda: ["admin"])
+    write_scopes: List[str] = field(default_factory=lambda: ["admin"])
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"enabled": self.enabled, "read_scopes": list(self.read_scopes),
+                "write_scopes": list(self.write_scopes)}
+
+
+def _admin_auth(raw: Dict[str, Any]) -> Optional[AdminAuth]:
+    """Optional root ``admin_auth`` block: omitted means the policy is absent
+    (and is not echoed by the sanitized config); when present it must be an
+    object with only ``enabled`` (a boolean), ``read_scopes`` and
+    ``write_scopes`` (non-empty arrays of non-empty strings). Any type error,
+    empty array, non-string or empty element and any extra field is rejected
+    with the same fixed message."""
+    if "admin_auth" not in raw:
+        return None
+    data = raw["admin_auth"]
+    if not isinstance(data, dict) or set(data) - set(ADMIN_AUTH_FIELDS):
+        raise GatewayError(ADMIN_AUTH_ERROR)
+    enabled = data.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise GatewayError(ADMIN_AUTH_ERROR)
+
+    def scopes(key: str) -> List[str]:
+        if key not in data:
+            return ["admin"]
+        value = data[key]
+        if (not isinstance(value, list) or not value
+                or any(not isinstance(item, str) or not item for item in value)):
+            raise GatewayError(ADMIN_AUTH_ERROR)
+        return list(value)
+
+    return AdminAuth(enabled, scopes("read_scopes"), scopes("write_scopes"))
+
+
 @dataclass
 class GatewayConfig:
     routes: List[Route] = field(default_factory=list)
     keys: List[ApiKey] = field(default_factory=list)
     policies: List[QuotaPolicy] = field(default_factory=list)
     revision: int = 0
+    admin_auth: Optional[AdminAuth] = None
 
     def matching_routes(self, method: str, path: str, tenant: Optional[str]) -> List[Route]:
         return [r for r in self.routes if r.matches(method, path, tenant)]
@@ -485,9 +538,14 @@ class GatewayConfig:
         return next((p for p in self.policies if p.id == policy_id), None)
 
     def sanitized(self) -> Dict[str, Any]:
-        return {"revision": self.revision, "routes": [r.to_dict() for r in self.routes],
-                "keys": [k.public() for k in self.keys],
-                "quota_policies": [p.to_dict() for p in self.policies]}
+        out = {"revision": self.revision, "routes": [r.to_dict() for r in self.routes],
+               "keys": [k.public() for k in self.keys],
+               "quota_policies": [p.to_dict() for p in self.policies]}
+        if self.admin_auth is not None:
+            # Echoed only when the document declared the block; an absent
+            # admin_auth keeps the historical sanitized shape.
+            out["admin_auth"] = self.admin_auth.to_dict()
+        return out
 
 
 def _list(raw: Dict[str, Any], key: str) -> List[Any]:
@@ -519,7 +577,7 @@ def parse(raw: Any) -> GatewayConfig:
                 if policy_id not in known:
                     raise GatewayError("route %s: unknown quota policy %r in quota_policies"
                                        % (route.id, policy_id))
-    return GatewayConfig(routes, keys, policies)
+    return GatewayConfig(routes, keys, policies, admin_auth=_admin_auth(raw))
 
 
 def load(path: str, revision: int = 0) -> GatewayConfig:

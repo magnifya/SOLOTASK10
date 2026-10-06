@@ -166,6 +166,52 @@ class Gateway:
     def sanitized_config(self) -> Dict[str, Any]:
         return self.config.sanitized()
 
+    def authorize_admin(self, headers: Dict[str, str], now_ms: int, access: str,
+                        tenant: Optional[str] = None,
+                        global_op: bool = False) -> Tuple[Optional[ApiKey], Optional[str],
+                                                          Optional[Tuple[int, str]]]:
+        """Authorize one admin (``/v1``) endpoint call against ``admin_auth``.
+
+        Returns ``(key, effective_tenant, error)``. ``error`` is ``None`` when
+        the call may proceed -- ``key`` is then ``None`` only when the policy
+        is disabled or absent and no authentication happened at all. Otherwise
+        ``error`` is ``(status, message)`` and the caller must reject before
+        any body parsing or mutation, so a failure never moves the revision,
+        the configuration, quota buckets, breaker state or idempotency state.
+
+        Credential resolution reuses the proxy rules (``Authorization:
+        Bearer`` / ``X-Api-Key-Secret`` plus a stated ``X-Api-Key``, validity
+        checked at the request start time), so missing, unknown, mismatched,
+        disabled and expired secrets keep their usual 401 texts. A read call
+        must satisfy every ``read_scopes`` entry, a write call every
+        ``write_scopes`` entry (``*`` satisfies any scope); a shortfall is a
+        403 ``admin scope is missing``. Tenant rules: a ``*`` key may omit or
+        name any tenant, any other key is confined to its own tenant (queries
+        default to it) and global operations (``GET /v1/config``, reload,
+        breaker reset) are reserved for ``*`` keys -- a violation is a 403
+        ``admin tenant mismatch``.
+        """
+        policy = self.config.admin_auth
+        if policy is None or not policy.enabled:
+            return None, tenant, None
+        hdrs = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
+        key, auth_error = self._resolve_key(hdrs, now_ms)
+        if auth_error is not None:
+            return None, tenant, (401, auth_error)
+        required = policy.write_scopes if access == "write" else policy.read_scopes
+        if not key.allows(required):
+            return None, tenant, (403, "admin scope is missing")
+        if global_op:
+            if key.tenant != ANY_TENANT:
+                return None, tenant, (403, "admin tenant mismatch")
+            return key, tenant, None
+        if key.tenant == ANY_TENANT:
+            # A wildcard key may omit the tenant (no filter) or name any one.
+            return key, tenant, None
+        if tenant and tenant != key.tenant:
+            return None, tenant, (403, "admin tenant mismatch")
+        return key, key.tenant, None
+
     # -------------------------------------------------------------- mutations
     def _mutate(self, mutate: Callable[[Dict[str, Any]], None]) -> None:
         path = self.store.path
