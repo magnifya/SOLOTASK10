@@ -22,7 +22,35 @@ IN_PROGRESS_ERROR = "idempotency request in progress"
 IN_PROGRESS_RETRY_AFTER = "1"
 CREDENTIAL_HEADERS = ("authorization", "x-api-key", "x-api-key-secret")
 HOP_HEADERS = ("host", "content-length", "connection", "transfer-encoding")
+TRACE_HEADERS = ("traceparent", "x-trace-id")
+_HEX = frozenset("0123456789abcdef")
 _UNSET = object()
+
+
+def _is_hex(value: str) -> bool:
+    return bool(value) and all(char in _HEX for char in value)
+
+
+def _parse_traceparent(value: str) -> Optional[Tuple[str, str, str]]:
+    """Parse a W3C ``traceparent`` header into ``(trace_id, parent_id, flags)``.
+
+    Only version ``00`` is accepted, with a 32 hex non-zero trace id, a 16 hex
+    non-zero parent id and exactly two hex flag digits -- all lowercase, as the
+    specification mandates. Anything else returns ``None``.
+    """
+    parts = (value or "").split("-")
+    if len(parts) != 4:
+        return None
+    version, trace_id, parent_id, flags = parts
+    if version != "00":
+        return None
+    if len(trace_id) != 32 or not _is_hex(trace_id) or trace_id == "0" * 32:
+        return None
+    if len(parent_id) != 16 or not _is_hex(parent_id) or parent_id == "0" * 16:
+        return None
+    if len(flags) != 2 or not _is_hex(flags):
+        return None
+    return trace_id, parent_id, flags
 
 
 class _IdempotencyScope(tuple):
@@ -185,6 +213,31 @@ class Gateway:
         body = body or ""
         hdrs = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
         request_id = hdrs.get("x-request-id") or uuid.uuid4().hex[:16]
+        # W3C Trace Context: every proxied request gets a local trace id and a
+        # gateway span id up front. A missing traceparent starts a root trace
+        # with flags 00; a valid one keeps the caller's trace id and flags and
+        # remembers the caller's parent id; an invalid one falls back to a
+        # local root context and the request is rejected below with a 400
+        # before auth, quota, idempotency or any upstream call.
+        span_id = secrets.token_hex(8)
+        traceparent_raw = hdrs.get("traceparent")
+        trace_error: Optional[str] = None
+        parent_span_id: Optional[str] = None
+        if traceparent_raw is None:
+            trace_id = secrets.token_hex(16)
+            trace_flags = "00"
+        else:
+            parsed_trace = _parse_traceparent(traceparent_raw)
+            if parsed_trace is None:
+                trace_id = secrets.token_hex(16)
+                trace_flags = "00"
+                trace_error = "invalid traceparent"
+            else:
+                trace_id, parent_span_id, trace_flags = parsed_trace
+        sampled = bool(int(trace_flags, 16) & 1)
+        # The canonical context this gateway propagates: its own span id under
+        # the (kept or freshly started) trace id, with the effective flags.
+        traceparent = "00-%s-%s-%s" % (trace_id, span_id, trace_flags)
         route: Optional[Route] = None
         upstream_name: Optional[str] = None
         key: Optional[ApiKey] = None
@@ -206,7 +259,9 @@ class Gateway:
                 "upstream": upstream_name or (route.upstream if route else None),
                 "status": int(status), "attempts": attempts,
                 "latency_ms": max(now - started_ms, int((time.monotonic() - mono) * 1000)),
-                "quota": dict(quota), "idempotent_replay": bool(replay)}
+                "quota": dict(quota), "idempotent_replay": bool(replay),
+                "trace_id": trace_id, "span_id": span_id,
+                "parent_span_id": parent_span_id, "sampled": sampled}
             if joint:
                 # A multi-policy route always names quotas; it is an empty list
                 # when the request never reached the joint check, and quota then
@@ -224,8 +279,23 @@ class Gateway:
                              if name.lower() == "x-api-version"]:
                     del out_headers[name]
                 out_headers["X-Api-Version"] = route.version
+            # The trace context of this processing always wins, even over a
+            # transform.response_headers entry or a replayed cached header with
+            # the same name: errors, breaker rejections, idempotency conflicts,
+            # 425s and replays all carry the freshly generated pair.
+            for name in [name for name in out_headers
+                         if name.lower() in TRACE_HEADERS]:
+                del out_headers[name]
+            out_headers["traceparent"] = traceparent
+            out_headers["X-Trace-Id"] = trace_id
             return {"status": int(status), "headers": out_headers, "body": text,
                     "request_id": request_id, "route_id": route.id if route else None}
+
+        if trace_error is not None:
+            # Rejected before routing, auth, quota, idempotency or any upstream
+            # call; the audit record keeps route_id null and attempts 0 and the
+            # response carries the local root context generated above.
+            return finish(400, {"error": trace_error, "request_id": request_id})
 
         key, auth_error = self._resolve_key(hdrs, now)
         explicit_tenant = tenant or ""
@@ -407,8 +477,16 @@ class Gateway:
         else:
             chain = [route.upstream]
         upstream_name = route.upstream
+        upstream_headers = self._upstream_headers(hdrs, route)
+        # Every actual upstream call -- each retry and each fallback hop --
+        # receives the canonical traceparent built from the current trace id
+        # and this gateway's span id, never the caller's original parent id.
+        upstream_headers["traceparent"] = traceparent
+        if "tracestate" in hdrs:
+            # tracestate is forwarded verbatim and never feeds routing or quota.
+            upstream_headers["tracestate"] = hdrs["tracestate"]
         request = {"method": method, "path": path, "body": body, "tenant": tenant,
-                   "request_id": request_id, "headers": self._upstream_headers(hdrs, route)}
+                   "request_id": request_id, "headers": upstream_headers}
         response = None
         status = TRANSPORT_ERROR
         rejected_state: Optional[str] = None
