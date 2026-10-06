@@ -15,6 +15,8 @@ from .breaker import TRANSPORT_ERROR, BreakerRegistry, RetryPolicy
 from .config import (ANY_TENANT, ApiKey, ConfigStore, GatewayError, QuotaPolicy,
                      Route, parse, read_raw, save_config, sha256_hex)
 from .limits import AuditLog, Limiter, QuotaLedger
+from .tracing import (TRACEPARENT_HEADER, TRACE_ID_HEADER, TRACESTATE_HEADER,
+                      TraceContext, parse_traceparent)
 from .upstream import UpstreamError, default_registry
 
 REPLAY_HEADER = "X-Idempotent-Replay"
@@ -22,6 +24,9 @@ IN_PROGRESS_ERROR = "idempotency request in progress"
 IN_PROGRESS_RETRY_AFTER = "1"
 CREDENTIAL_HEADERS = ("authorization", "x-api-key", "x-api-key-secret")
 HOP_HEADERS = ("host", "content-length", "connection", "transfer-encoding")
+#: Response headers the gateway owns; ``transform.response_headers`` and an
+#: upstream answer can never override them.
+TRACE_RESPONSE_HEADERS = ("traceparent", "x-trace-id")
 _UNSET = object()
 
 
@@ -185,6 +190,23 @@ class Gateway:
         body = body or ""
         hdrs = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
         request_id = hdrs.get("x-request-id") or uuid.uuid4().hex[:16]
+        # 0. W3C trace context. Adopt a valid inbound ``traceparent``; with none
+        # present mint a local root (flags 00, no parent). An illegal value is
+        # answered 400 against a fresh local root and audited with route_id
+        # null and attempts 0, before auth, quota, idempotency or any upstream
+        # call. Tracing never feeds routing, quota or weighting.
+        trace_invalid = False
+        raw_traceparent = hdrs.get(TRACEPARENT_HEADER)
+        if raw_traceparent:
+            try:
+                trace = parse_traceparent(raw_traceparent)
+            except ValueError:
+                trace = TraceContext.root()
+                trace_invalid = True
+        else:
+            trace = TraceContext.root()
+        # tracestate is opaque vendor state: forwarded verbatim, never parsed.
+        tracestate = hdrs.get(TRACESTATE_HEADER)
         route: Optional[Route] = None
         upstream_name: Optional[str] = None
         key: Optional[ApiKey] = None
@@ -202,6 +224,8 @@ class Gateway:
             audit_entry: Dict[str, Any] = {
                 "at": now, "request_id": request_id, "tenant": tenant,
                 "key_id": key.key_id if key else None,
+                "trace_id": trace.trace_id, "span_id": trace.span_id,
+                "parent_span_id": trace.parent_span_id, "sampled": trace.sampled,
                 "route_id": route.id if route else None,
                 "upstream": upstream_name or (route.upstream if route else None),
                 "status": int(status), "attempts": attempts,
@@ -217,6 +241,16 @@ class Gateway:
             if route:
                 out_headers.update(route.response_headers)
             out_headers.update(extra_headers or {})
+            # The correlation headers are regenerated for this request on every
+            # answer -- errors, breaker refusals, idempotency conflicts/in-flight
+            # rejections and replays included -- and win over any configured
+            # transform or any header carried by an upstream response or a
+            # cached replay. A replay keeps only the cached status and body; its
+            # tracing headers are freshly minted here.
+            for name in [name for name in out_headers if name.lower() in TRACE_RESPONSE_HEADERS]:
+                del out_headers[name]
+            out_headers["traceparent"] = trace.traceparent()
+            out_headers[TRACE_ID_HEADER] = trace.trace_id
             if route and route.version is not None:
                 # The selected route's version always wins, even over a
                 # transform.response_headers entry with the same name.
@@ -226,6 +260,14 @@ class Gateway:
                 out_headers["X-Api-Version"] = route.version
             return {"status": int(status), "headers": out_headers, "body": text,
                     "request_id": request_id, "route_id": route.id if route else None}
+
+        if trace_invalid:
+            # A malformed traceparent is rejected before authentication, quota,
+            # idempotency and any upstream call: the audit record keeps
+            # route_id null and attempts 0 and the answer carries a freshly
+            # minted local root correlation context.
+            return finish(400, {"error": "invalid traceparent",
+                                "request_id": request_id})
 
         key, auth_error = self._resolve_key(hdrs, now)
         explicit_tenant = tenant or ""
@@ -408,7 +450,8 @@ class Gateway:
             chain = [route.upstream]
         upstream_name = route.upstream
         request = {"method": method, "path": path, "body": body, "tenant": tenant,
-                   "request_id": request_id, "headers": self._upstream_headers(hdrs, route)}
+                   "request_id": request_id,
+                   "headers": self._upstream_headers(hdrs, route, trace, tracestate)}
         response = None
         status = TRANSPORT_ERROR
         rejected_state: Optional[str] = None
@@ -560,8 +603,23 @@ class Gateway:
         return pool[-1]
 
     @staticmethod
-    def _upstream_headers(hdrs: Dict[str, str], route: Route) -> Dict[str, str]:
+    def _upstream_headers(hdrs: Dict[str, str], route: Route,
+                          trace: TraceContext, tracestate: Optional[str] = None) -> Dict[str, str]:
         out = {name: value for name, value in hdrs.items()
-               if name not in CREDENTIAL_HEADERS and name not in HOP_HEADERS}
+               if name not in CREDENTIAL_HEADERS and name not in HOP_HEADERS
+               # The inbound traceparent is replaced by the gateway's own
+               # canonical hop, never forwarded as received.
+               and name != TRACEPARENT_HEADER}
         out.update(route.request_headers)
+        # Every actual upstream call -- a retry or a failover attempt just the
+        # same -- carries the canonical traceparent built from the current trace
+        # id and this gateway span, so it wins even over a request transform
+        # that tried to set its own. tracestate is only ever the inbound value
+        # forwarded verbatim; a transform cannot forge vendor state.
+        for name in [name for name in out
+                     if name.lower() in (TRACEPARENT_HEADER, TRACESTATE_HEADER)]:
+            del out[name]
+        out[TRACEPARENT_HEADER] = trace.traceparent()
+        if tracestate:
+            out[TRACESTATE_HEADER] = tracestate
         return out

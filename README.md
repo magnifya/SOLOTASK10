@@ -4,7 +4,8 @@
 library only. It owns the cross cutting concerns of an internal API platform:
 versioned routing, API key authentication, quota governance with a usage ledger,
 circuit breaking, bounded retries, request/response header transformation,
-idempotent replay protection, per tenant isolation and an audit trail.
+idempotent replay protection, per tenant isolation, W3C Trace Context
+correlation and an audit trail.
 
 It runs offline, on Python 3.10+, on Linux (WSL Ubuntu-24.04) or Windows. There
 are no third party dependencies and no network calls except to the upstreams you
@@ -113,7 +114,9 @@ tests; only the HTTP front end reads the wall clock.
 9. **Audit.** One JSON line per request is appended to `<data-dir>/audit.jsonl`
    with `at`, `request_id`, `tenant`, `key_id`, `route_id`, `upstream`, `status`,
    `latency_ms`, `attempts`, `quota{policy_id,allowed,remaining,cost}` and
-   `idempotent_replay`; `cost` is the actual charge applied (the route's
+   `idempotent_replay`, plus the correlation fields
+   `trace_id`, `span_id`, `parent_span_id` and `sampled` (see
+   [W3C Trace Context](#w3c-trace-context)); `cost` is the actual charge applied (the route's
    `quota_cost`) and appears only once the quota check ran — a route without a
    quota policy keeps the historical `{policy_id: null, allowed: true,
    remaining: null}` block with no `cost`. A `quota_policies` route
@@ -121,6 +124,66 @@ tests; only the HTTP front end reads the wall clock.
    `{policy_id, allowed, remaining, cost}` in declaration order; the legacy
    `quota` block equals its first entry. `quotas` is `[]` (and `quota` keeps
    its unchecked value) when such a request never reached the joint check.
+
+## W3C Trace Context
+
+Every proxy request — `Gateway.handle` and the HTTP proxy share one
+implementation — enters the pipeline with one trace context:
+
+* a **trace-id** of 32 lowercase hex characters and a **gateway span-id** of
+  16 lowercase hex characters are generated locally for each request;
+* a request **without** a `traceparent` uses that local root, with flags
+  `00` and no parent (`parent_span_id` is `null` in the audit entry);
+* a request **with** a `traceparent` is accepted only in the strict W3C
+  version-`00` form
+  `00-<trace-id:32 hex>-<parent-id:16 hex>-<flags:2 hex>` where neither id is
+  all zero. A valid value adopts its trace-id and flags, the gateway mints its
+  own span-id and records the inbound parent-id as `parent_span_id`;
+* an **invalid** value (wrong version, wrong shape or casing, all-zero id, bad
+  flags) is rejected with `400 {"error": "invalid traceparent", "request_id"}`
+  against a freshly minted local root, before route selection even matters:
+  the request never enters authentication, quota, idempotency or any upstream
+  call, and exactly one audit record is written with `route_id: null` and
+  `attempts: 0`.
+
+Tracing is correlation only: the trace context never participates in route
+matching, quota, weighting or the retry/failover decision, and a request
+without tracing keeps its historical forwarding, billing and degradation
+outcomes.
+
+**Upstream hop.** Every actual upstream call — each bounded retry and every
+failover upstream included — receives the canonical
+
+```
+traceparent: 00-<trace-id>-<gateway span-id>-<flags>
+```
+
+built from the request's trace-id and the gateway span-id, so all attempts and
+upstreams share the one context. An inbound `tracestate`, when present, is
+forwarded verbatim; without one none is sent. The canonical headers win over
+any `transform.request_headers` entry of the same name.
+
+**Response hop.** Every proxy response, including errors, breaker refusals,
+idempotency conflicts (`409`), in-flight rejections (`425`) and replays,
+returns:
+
+* `traceparent: 00-<trace-id>-<gateway span-id>-<flags>`
+* `X-Trace-Id: <trace-id>`
+
+These two headers are owned by the gateway: a `transform.response_headers`
+entry (or an upstream response carrying them) can never override them. A
+replay reuses only the cached status and body — its tracing headers and its
+audit event are generated for the current request, so each replay carries a
+fresh gateway span-id while keeping the trace chain.
+
+**Audit.** Each `audit.jsonl` record additionally carries
+`trace_id`, `span_id`, `parent_span_id` and `sampled`; `sampled` is whether
+the lowest bit of the two flags digits is `1` (`flags` ending in `1`, `3`,
+… `f`). `GET /v1/audit` keeps its existing tenant/limit filters and return
+shape — the new fields are simply present on every record. The usage ledger,
+configuration format, management endpoints, `request_id` and weighted stable
+selection are unchanged, and older audit lines without the fields remain
+readable.
 
 ## Weighted routing (documented rule)
 
@@ -524,7 +587,7 @@ are unauthenticated in this skeleton - front them with your own auth in producti
 | GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | `400` non-integer `since` |
 | GET | `/v1/audit?tenant=&limit=` | `200 {"tenant","count","entries"}` | `400` non-integer `limit` |
 | POST | `/v1/breaker/reset` | `200 {"reset":["upstream",...]}` | `400` bad JSON |
-| * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition), `401` missing/unknown/disabled/expired key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict (finished or in-flight response with a different body), `425` same idempotency scope still in progress with the same body, `429` quota exceeded, `502` upstream error, `503` breaker open |
+| * | any other path | proxied through the pipeline | `400` invalid `traceparent` or empty tenant (tenant partition), `401` missing/unknown/disabled/expired key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict (finished or in-flight response with a different body), `425` same idempotency scope still in progress with the same body, `429` quota exceeded, `502` upstream error, `503` breaker open |
 
 A `/gw/{path}` prefix on the proxy surface is stripped before matching upstreams,
 so `/gw/api/items` is matched as `/api/items`.
@@ -544,6 +607,7 @@ gwd/__init__.py    public surface: Gateway, QuotaLedger, create_server
 gwd/config.py      models, validation, mtime hot reload
 gwd/limits.py      token/leaky/sliding limiters, quota ledger, audit log
 gwd/breaker.py     circuit breaker state machine, retry policy
+gwd/tracing.py     W3C traceparent minting, strict parsing, tracestate
 gwd/gateway.py     the request pipeline
 gwd/upstream.py    upstream registry, stdlib HTTP client, echo upstream
 gwd/http_app.py    ThreadingHTTPServer, admin surface, proxy surface

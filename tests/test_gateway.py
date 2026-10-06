@@ -632,8 +632,9 @@ class TransformAndAuditTest(GatewayTestCase):
         self.gateway.handle("acme", "GET", "/api/items", self.auth(), "", now_ms=1234)
         entry = self.gateway.audit("acme", 5)[-1]
         self.assertEqual(sorted(entry), ["at", "attempts", "idempotent_replay", "key_id",
-                                         "latency_ms", "quota", "request_id", "route_id",
-                                         "status", "tenant", "upstream"])
+                                         "latency_ms", "parent_span_id", "quota", "request_id",
+                                         "route_id", "sampled", "span_id", "status", "tenant",
+                                         "trace_id", "upstream"])
         self.assertEqual(entry["at"], 1234)
         self.assertEqual(entry["tenant"], "acme")
         self.assertEqual(entry["key_id"], "k-read")
