@@ -163,6 +163,13 @@ class Gateway:
     def breaker_reset(self, name: Optional[str] = None) -> List[str]:
         return self.breakers.reset(name)
 
+    def breaker_status(self) -> Dict[str, Any]:
+        """Snapshot every breaker created so far, keyed by upstream name. The
+        read is side-effect free: it never calls an upstream, reloads config,
+        resets a breaker or advances any state — an open breaker stays open
+        until a request (not a query) observes the cooldown elapse."""
+        return {"breakers": self.breakers.snapshot()}
+
     def sanitized_config(self) -> Dict[str, Any]:
         return self.config.sanitized()
 

@@ -635,6 +635,7 @@ absent or disabled (see [Admin surface authentication](#admin-surface-authentica
 | GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | same `401`; `403` scope / `admin tenant mismatch`; `400` non-integer `since` |
 | GET | `/v1/audit?tenant=&limit=&request_id=&trace_id=&route_id=&status=&since=&until=` | `200 {"tenant","count","entries"}` | same `401`; `403` scope / `admin tenant mismatch`; `400 {"error":"invalid audit query","parameter",...}` for a malformed `trace_id` (not 32 lowercase hex), `status` (not a 100-599 decimal integer), non-integer `since`/`until` or `until` earlier than `since`; `400` non-integer `limit` |
 | POST | `/v1/breaker/reset` | `200 {"reset":["upstream",...]}` | same `401`; `403` scope / `admin tenant mismatch` (needs a `tenant: "*"` key); `400` bad JSON |
+| GET | `/v1/breaker/status` | `200 {"breakers":{"upstream":{...}}}` — one snapshot per breaker created so far, keyed by upstream name in sorted order; empty object when none exist | same `401`; `403` scope / `admin tenant mismatch` (needs a `tenant: "*"` key) |
 | * | any other path | proxied through the pipeline | `400` empty tenant (tenant partition), `401` missing/unknown/disabled/expired key or key partition without a valid key, `403` scope or tenant, `404` no route, `409` idempotency conflict (finished or in-flight response with a different body), `425` same idempotency scope still in progress with the same body, `429` quota exceeded, `502` upstream error, `503` breaker open |
 
 A `/gw/{path}` prefix on the proxy surface is stripped before matching upstreams,
@@ -690,8 +691,8 @@ before the request body is parsed and before anything is mutated, so a rejected
 request never changes the revision, config, quota buckets, breakers or
 idempotency state.
 
-* **Reads** — `GET /v1/config`, `GET /v1/quota/usage`, `GET /v1/audit` —
-  require every scope in `read_scopes`.
+* **Reads** — `GET /v1/config`, `GET /v1/quota/usage`, `GET /v1/audit`,
+  `GET /v1/breaker/status` — require every scope in `read_scopes`.
 * **Writes** — the `/v1` write commands (`/v1/keys`, key rotation,
   `/v1/quota/policies`, `/v1/config/reload`, `/v1/breaker/reset`) — require
   every scope in `write_scopes`.
@@ -709,8 +710,9 @@ Tenant rules on top of the scope check:
   authenticated key's tenant; a `tenant: "*"` key may create for any tenant.
   Key rotation is owner scoped: only the target key's owner or a `tenant: "*"`
   key may rotate it (an unknown key id is still `404`).
-* Global operations — `GET /v1/config`, `POST /v1/config/reload` and
-  `POST /v1/breaker/reset` — are allowed only for a key whose tenant is `*`.
+* Global operations — `GET /v1/config`, `POST /v1/config/reload`,
+  `POST /v1/breaker/reset` and `GET /v1/breaker/status` — are allowed only
+  for a key whose tenant is `*`.
 
 A valid hot reload applies the new policy to later requests only; in-flight
 requests keep the credentials and policy they started with. Disabling the

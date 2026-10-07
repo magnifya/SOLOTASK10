@@ -14,11 +14,13 @@ from .config import ANY_TENANT, GatewayError
 from .gateway import Gateway
 from .limits import parse_audit_filters
 
-ADMIN_GET = ("/healthz", "/v1/config", "/v1/quota/usage", "/v1/audit")
+ADMIN_GET = ("/healthz", "/v1/config", "/v1/quota/usage", "/v1/audit",
+             "/v1/breaker/status")
 ADMIN_POST = ("/v1/config/reload", "/v1/keys", "/v1/quota/policies", "/v1/breaker/reset")
 # Global operations act on the whole gateway rather than one tenant's data:
 # when admin auth is enabled only a key whose tenant is "*" may run them.
-ADMIN_GLOBAL = ("/v1/config", "/v1/config/reload", "/v1/breaker/reset")
+ADMIN_GLOBAL = ("/v1/config", "/v1/config/reload", "/v1/breaker/reset",
+                "/v1/breaker/status")
 ADMIN_SCOPE_ERROR = "admin scope is missing"
 ADMIN_TENANT_ERROR = "admin tenant mismatch"
 
@@ -217,6 +219,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         elif target == "/v1/breaker/reset":
             payload = _json_body(raw, default={})
             self._json(200, {"reset": gateway.breaker_reset(payload.get("upstream"))}, request_id)
+        elif target == "/v1/breaker/status":
+            self._json(200, gateway.breaker_status(), request_id)
         else:
             return False
         return True

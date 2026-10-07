@@ -240,7 +240,8 @@ class AdminAuthHttpTest(unittest.TestCase):
 
     # ------------------------------------------------------------- 401 reasons
     def test_read_requires_a_key(self):
-        for path in ("/v1/config", "/v1/quota/usage", "/v1/audit"):
+        for path in ("/v1/config", "/v1/quota/usage", "/v1/audit",
+                     "/v1/breaker/status"):
             status, _, payload = self.json_request("GET", path)
             self.assertEqual(status, 401, path)
             self.assertEqual(payload["error"], "missing api key", path)
@@ -301,6 +302,10 @@ class AdminAuthHttpTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "admin scope is missing")
         self.assertIn("request_id", payload)
+        status, _, payload = self.json_request(
+            "GET", "/v1/breaker/status", headers=self.bearer(SECRET_ACME_READ))
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "admin scope is missing")
         status, _, payload = self.json_request(
             "POST", "/v1/keys", {"tenant": "acme"},
             headers=self.bearer(SECRET_ACME_READ))
@@ -474,6 +479,10 @@ class AdminAuthHttpTest(unittest.TestCase):
             headers=self.bearer(SECRET_GLOB_ADMIN))
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "admin tenant mismatch")
+        status, _, payload = self.json_request(
+            "GET", "/v1/breaker/status", headers=self.bearer(SECRET_ACME_ADMIN))
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "admin tenant mismatch")
         # the star-tenant key passes all three
         status, _, _ = self.json_request(
             "GET", "/v1/config", headers=self.bearer(SECRET_ROOT))
@@ -486,6 +495,10 @@ class AdminAuthHttpTest(unittest.TestCase):
             headers=self.bearer(SECRET_ROOT))
         self.assertEqual(status, 200)
         self.assertEqual(payload["reset"], ["echo"])
+        status, _, payload = self.json_request(
+            "GET", "/v1/breaker/status", headers=self.bearer(SECRET_ROOT))
+        self.assertEqual(status, 200)
+        self.assertIn("breakers", payload)
 
     def test_failed_auth_changes_no_state(self):
         before = self.gateway.sanitized_config()

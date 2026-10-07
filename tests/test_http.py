@@ -323,6 +323,52 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["reset"], ["echo"])
 
+    def test_breaker_status_endpoint(self):
+        # no breaker has been created yet: an empty object, still a 200
+        status, headers, payload = self.json_request("GET", "/v1/breaker/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"breakers": {}})
+        self.assertIn("X-Request-Id", headers)
+        self.assertTrue(headers["Content-Type"].startswith("application/json"))
+        # querying must not create breakers for untouched upstreams
+        status, _, payload = self.json_request("GET", "/v1/breaker/status")
+        self.assertEqual(payload, {"breakers": {}})
+
+        breaker = self.gateway.breakers.get("echo")
+        breaker.allow(0)
+        breaker.record(False, 0)
+        self.gateway.breakers.get("api")  # a second breaker, still closed
+        status, _, payload = self.json_request("GET", "/v1/breaker/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(sorted(payload["breakers"]), ["api", "echo"])
+        snap = payload["breakers"]["echo"]
+        self.assertEqual(snap["name"], "echo")
+        self.assertEqual(snap["state"], "closed")
+        self.assertEqual(snap["failures"], 1)
+        for field in ("successes", "probes", "failure_threshold", "open_ms",
+                      "half_open_max_probes", "success_threshold", "opened_at_ms",
+                      "last_change_ms", "trips", "rejected"):
+            self.assertIn(field, snap)
+        # the read is side-effect free: nothing about the breaker changed
+        self.assertEqual(self.gateway.breakers.get("echo").snapshot(), snap)
+
+    def test_breaker_status_does_not_advance_open_breakers(self):
+        breaker = self.gateway.breakers.get("echo")
+        for _ in range(breaker.failure_threshold):
+            breaker.allow(0)
+            breaker.record(False, 0)
+        self.assertEqual(breaker.state, "open")
+        # far past open_ms, but a status query must not promote half_open
+        status, _, payload = self.json_request("GET", "/v1/breaker/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["breakers"]["echo"]["state"], "open")
+        self.assertEqual(self.gateway.breakers.get("echo").state, "open")
+
+    def test_breaker_status_wrong_method_falls_through_to_the_proxy(self):
+        status, _, payload = self.json_request("POST", "/v1/breaker/status", {})
+        self.assertEqual(status, 404)
+        self.assertIn("no route", payload["error"])
+
     def test_unknown_admin_route_falls_through_to_the_proxy(self):
         status, _, payload = self.json_request("GET", "/v1/does-not-exist")
         self.assertEqual(status, 404)
