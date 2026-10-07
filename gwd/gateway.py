@@ -150,8 +150,10 @@ class Gateway:
                 "upstreams": len(self.upstreams.names()),
                 "config_error": self.store.last_error}
 
-    def usage(self, tenant: str = "", since_ms: Optional[int] = None) -> Dict[str, Any]:
-        return self.ledger.usage(tenant or None, since_ms)
+    def usage(self, tenant: str = "", since_ms: Optional[int] = None,
+              request_id: Optional[str] = None,
+              trace_id: Optional[str] = None) -> Dict[str, Any]:
+        return self.ledger.usage(tenant or None, since_ms, request_id, trace_id)
 
     def audit(self, tenant: str = "", limit: int = 50, **filters: Any) -> List[Dict[str, Any]]:
         """Read the audit trail; ``filters`` are validated ``AuditLog.entries``
@@ -480,9 +482,12 @@ class Gateway:
             for result in results:
                 # Exactly one ledger line per named policy per request, each
                 # carrying this request's full fixed cost; retries, failover
-                # and an idempotent replay never pass through here twice.
+                # and an idempotent replay never pass through here twice. Every
+                # line of one request shares that request's request_id and
+                # trace_id, so a charge can be reconciled with its audit entry.
                 self.ledger.record(tenant, result["policy_id"],
-                                   key.key_id if key else None, cost, group_allowed, now)
+                                   key.key_id if key else None, cost, group_allowed, now,
+                                   request_id=request_id, trace_id=trace_id)
             if not group_allowed:
                 insufficient = [result for result in results if not result["allowed"]]
                 first_short = next(result for result in results if not result["allowed"])
