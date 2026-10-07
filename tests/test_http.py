@@ -323,10 +323,65 @@ class HttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(payload["reset"], ["echo"])
 
+    def test_breaker_status_endpoint(self):
+        # No breaker has been created yet: still a 200 with an empty object.
+        status, headers, payload = self.json_request("GET", "/v1/breaker/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertEqual(payload, {"breakers": {}})
+        self.assertIn("X-Request-Id", headers)
+        # Only upstreams with an already created breaker are listed, sorted by
+        # name; a query never creates one for an untouched upstream.
+        zeta = self.gateway.breakers.get("zeta")
+        zeta.allow(0)
+        for _ in range(zeta.failure_threshold):
+            zeta.record(False, 0)
+        alpha = self.gateway.breakers.get("alpha")
+        alpha.allow(0)
+        alpha.record(True, 0)
+        status, _, payload = self.json_request("GET", "/v1/breaker/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(list(payload["breakers"]), ["alpha", "zeta"])
+        self.assertNotIn("echo", payload["breakers"])
+        snapshot = payload["breakers"]["zeta"]
+        self.assertEqual(snapshot["name"], "zeta")
+        self.assertEqual(snapshot["state"], "open")
+        for field in ("failures", "successes", "probes", "failure_threshold", "open_ms",
+                      "half_open_max_probes", "success_threshold", "opened_at_ms",
+                      "last_change_ms", "trips", "rejected"):
+            self.assertIn(field, snapshot)
+        self.assertEqual(snapshot["trips"], 1)
+        self.assertEqual(payload["breakers"]["alpha"]["state"], "closed")
+
+    def test_breaker_status_is_read_only(self):
+        # Snapshotting never runs the open -> half_open promotion: a breaker
+        # whose open window has fully elapsed still reports "open", and the
+        # query writes no audit entries itself.
+        breaker = self.gateway.breakers.get("echo")
+        breaker.allow(0)
+        for _ in range(breaker.failure_threshold):
+            breaker.record(False, 0)
+        breaker.opened_at_ms = 0
+        breaker.last_change_ms = 0
+        _, _, before = self.json_request("GET", "/v1/audit?limit=50")
+        status, _, payload = self.json_request("GET", "/v1/breaker/status")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["breakers"]["echo"]["state"], "open")
+        _, _, after = self.json_request("GET", "/v1/audit?limit=50")
+        self.assertEqual(after["count"], before["count"])
+
     def test_unknown_admin_route_falls_through_to_the_proxy(self):
         status, _, payload = self.json_request("GET", "/v1/does-not-exist")
         self.assertEqual(status, 404)
         self.assertIn("no route", payload["error"])
+
+    def test_breaker_status_wrong_method_falls_through_to_the_proxy(self):
+        # POST on a GET-only admin route is not an admin hit: it reaches the
+        # proxy surface (which has no such route), exactly like a wrong method
+        # on the other read endpoints, and never touches a breaker.
+        status, _, _ = self.json_request("POST", "/v1/breaker/status", {})
+        self.assertEqual(status, 404)
+        self.assertEqual(self.gateway.breaker_status(), {})
 
 
 if __name__ == "__main__":

@@ -160,6 +160,16 @@ class Gateway:
         config, clears state or calls an upstream."""
         return self.audit_log.entries(tenant or None, limit, **filters)
 
+    def breaker_status(self) -> Dict[str, Dict[str, Any]]:
+        """Snapshots of the breakers created so far, keyed by upstream name.
+
+        Read-only: it only reports the breakers a request has already touched,
+        never creates one for an untouched upstream, never runs the clock-driven
+        open -> half_open promotion (``allow`` is not called), and never reloads
+        config or appends to the usage or audit logs.
+        """
+        return self.breakers.snapshot()
+
     def breaker_reset(self, name: Optional[str] = None) -> List[str]:
         return self.breakers.reset(name)
 

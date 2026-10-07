@@ -237,10 +237,17 @@ class AdminAuthHttpTest(unittest.TestCase):
         request = urllib.request.Request(base + "/v1/config")
         with urllib.request.urlopen(request, timeout=5) as response:
             self.assertEqual(response.status, 200)
+        # the breaker status read keeps its historical open behaviour too
+        request = urllib.request.Request(base + "/v1/breaker/status")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(response.status, 200)
+            self.assertEqual(json.loads(response.read().decode("utf-8")),
+                             {"breakers": {}})
 
     # ------------------------------------------------------------- 401 reasons
     def test_read_requires_a_key(self):
-        for path in ("/v1/config", "/v1/quota/usage", "/v1/audit"):
+        for path in ("/v1/config", "/v1/quota/usage", "/v1/audit",
+                     "/v1/breaker/status"):
             status, _, payload = self.json_request("GET", path)
             self.assertEqual(status, 401, path)
             self.assertEqual(payload["error"], "missing api key", path)
@@ -301,6 +308,10 @@ class AdminAuthHttpTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "admin scope is missing")
         self.assertIn("request_id", payload)
+        status, _, payload = self.json_request(
+            "GET", "/v1/breaker/status", headers=self.bearer(SECRET_ACME_READ))
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "admin scope is missing")
         status, _, payload = self.json_request(
             "POST", "/v1/keys", {"tenant": "acme"},
             headers=self.bearer(SECRET_ACME_READ))
@@ -474,7 +485,12 @@ class AdminAuthHttpTest(unittest.TestCase):
             headers=self.bearer(SECRET_GLOB_ADMIN))
         self.assertEqual(status, 403)
         self.assertEqual(payload["error"], "admin tenant mismatch")
-        # the star-tenant key passes all three
+        # the global breaker status read needs a tenant "*" key as well
+        status, _, payload = self.json_request(
+            "GET", "/v1/breaker/status", headers=self.bearer(SECRET_GLOB_ADMIN))
+        self.assertEqual(status, 403)
+        self.assertEqual(payload["error"], "admin tenant mismatch")
+        # the star-tenant key passes all four
         status, _, _ = self.json_request(
             "GET", "/v1/config", headers=self.bearer(SECRET_ROOT))
         self.assertEqual(status, 200)
@@ -482,10 +498,47 @@ class AdminAuthHttpTest(unittest.TestCase):
             "POST", "/v1/config/reload", {}, headers=self.bearer(SECRET_ROOT))
         self.assertEqual(status, 200)
         status, _, payload = self.json_request(
+            "GET", "/v1/breaker/status", headers=self.bearer(SECRET_ROOT))
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"breakers": {}})
+        status, _, payload = self.json_request(
             "POST", "/v1/breaker/reset", {"upstream": "echo"},
             headers=self.bearer(SECRET_ROOT))
         self.assertEqual(status, 200)
         self.assertEqual(payload["reset"], ["echo"])
+
+    def test_breaker_status_is_read_only_for_the_star_key(self):
+        breaker = self.gateway.breakers.get("echo")
+        breaker.allow(0)
+        breaker.record(False, 0)  # threshold is 1 in this suite: trips open
+        self.assertEqual(breaker.state, "open")
+        revision = self.gateway.store.revision
+        status, _, payload = self.json_request(
+            "GET", "/v1/breaker/status", headers=self.bearer(SECRET_ROOT))
+        self.assertEqual(status, 200)
+        self.assertEqual(list(payload["breakers"]), ["echo"])
+        snapshot = payload["breakers"]["echo"]
+        self.assertEqual(snapshot["state"], "open")  # query does not advance it
+        self.assertEqual(snapshot["trips"], 1)
+        self.assertEqual(snapshot["failure_threshold"], 1)
+        self.assertEqual(snapshot["open_ms"], 60_000)
+        self.assertEqual(snapshot["success_threshold"], 1)
+        # repeated reads return identical state: no counters move, and the
+        # request changed no revision, usage or audit state
+        _, _, again = self.json_request(
+            "GET", "/v1/breaker/status", headers=self.bearer(SECRET_ROOT))
+        self.assertEqual(again, payload)
+        self.assertEqual(self.gateway.store.revision, revision)
+        self.assertEqual(self.gateway.breakers.get("echo").state, "open")
+        self.assertEqual(self.gateway.breakers.get("echo").rejected, 0)
+        # an open window elapsed long ago is still reported open: the read
+        # never calls allow(), so open -> half_open never happens
+        breaker.opened_at_ms = 0
+        breaker.last_change_ms = 0
+        status, _, payload = self.json_request(
+            "GET", "/v1/breaker/status", headers=self.bearer(SECRET_ROOT))
+        self.assertEqual(payload["breakers"]["echo"]["state"], "open")
+        self.assertEqual(self.gateway.breakers.get("echo").state, "open")
 
     def test_failed_auth_changes_no_state(self):
         before = self.gateway.sanitized_config()
@@ -496,11 +549,19 @@ class AdminAuthHttpTest(unittest.TestCase):
         self.json_request("GET", "/v1/config", headers=self.bearer(SECRET_ACME_ADMIN))
         self.json_request("GET", "/v1/quota/usage?tenant=globex",
                           headers=self.bearer(SECRET_ACME_ADMIN))
+        self.json_request("GET", "/v1/breaker/status")  # 401: no credential
+        self.json_request("GET", "/v1/breaker/status",
+                          headers=self.bearer(SECRET_ACME_READ))  # 403: scope
+        self.json_request("GET", "/v1/breaker/status",
+                          headers=self.bearer(SECRET_ACME_ADMIN))  # 403: tenant
         self.json_request("POST", "/v1/keys", {"tenant": "globex"},
                           headers=self.bearer(SECRET_ACME_ADMIN))
         self.assertEqual(self.gateway.sanitized_config(), before)
         self.assertEqual(self.gateway.store.revision, before["revision"])
         self.assertEqual(self.gateway.breakers.get("echo").state, "open")
+        # the rejected status queries neither created another breaker nor
+        # advanced the open one past its state
+        self.assertEqual(sorted(self.gateway.breakers.snapshot()), ["echo"])
 
     # ------------------------------------------------------------- hot reload
     def _reload(self, admin_auth):
