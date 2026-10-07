@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from .config import ANY_SCOPE, GatewayError
 from .gateway import Gateway
 from .http_app import create_server
-from .limits import AuditLog, QuotaLedger, parse_audit_filters
+from .limits import AuditLog, QuotaLedger, parse_audit_filters, parse_usage_filters
 
 
 def _out(payload: Any) -> None:
@@ -118,7 +118,8 @@ def _maybe_json(text: str) -> Any:
 
 
 def cmd_usage(args: argparse.Namespace) -> Dict[str, Any]:
-    return QuotaLedger(args.data_dir).usage(args.tenant or None, args.since)
+    filters = parse_usage_filters(request_id=args.request_id, trace_id=args.trace_id)
+    return QuotaLedger(args.data_dir).usage(args.tenant or None, args.since, **filters)
 
 
 def cmd_audit(args: argparse.Namespace) -> Dict[str, Any]:
@@ -179,6 +180,9 @@ def build_parser() -> argparse.ArgumentParser:
     usage = sub.add_parser("usage", help="aggregate the local usage ledger")
     usage.add_argument("--tenant", default="")
     usage.add_argument("--since", type=int, default=None)
+    usage.add_argument("--request-id", default=None, help="exact request_id match")
+    usage.add_argument("--trace-id", default=None,
+                       help="exact trace_id match (32 lowercase hex digits)")
     usage.set_defaults(func=cmd_usage)
 
     audit = sub.add_parser("audit", help="read the local audit trail")

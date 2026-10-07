@@ -40,7 +40,7 @@ directly, so they work without a running server.
 | `key-rotate --key-id` | replace a key's secret, print the new plaintext once |
 | `quota-set --file <json>` | append a quota policy (or array) |
 | `call --method --path --tenant --key --idempotency-key` | call a running gateway through the proxy surface |
-| `usage --tenant [--since]` | aggregate the local `usage.jsonl` ledger |
+| `usage --tenant [--since] [--request-id] [--trace-id]` | aggregate the local `usage.jsonl` ledger |
 | `audit --tenant [--limit] [--request-id] [--trace-id] [--route-id] [--status] [--since] [--until]` | read the local `audit.jsonl` trail |
 
 Every command prints a single line of JSON on stdout, and on failure prints a
@@ -404,15 +404,20 @@ bucket allows an initial burst of `limit` and then sustains `limit` per
 sliding window is the exact count of timestamps in the trailing window.
 
 `QuotaLedger` appends one JSON object per line to `<data-dir>/usage.jsonl`
-(`at`, `tenant`, `policy_id`, `key_id`, `cost`, `allowed`) with a single `write`
+(`at`, `tenant`, `policy_id`, `key_id`, `cost`, `allowed`, plus `request_id`
+and `trace_id` taken from the request's trace context) with a single `write`
 call per entry, so a crash can only leave a torn trailing line, which readers
 skip. A joint admission writes one record per named policy for a single request:
 every record of that request carries the same full `cost` (the route's
-`quota_cost`) and the whole group's verdict in `allowed` (all `true` on
-admission, all `false` otherwise). `usage(tenant, since_ms)` aggregates
+`quota_cost`), the whole group's verdict in `allowed` (all `true` on
+admission, all `false` otherwise) and the same `request_id` / `trace_id` pair.
+`usage(tenant, since_ms, request_id, trace_id)` aggregates
 requests, allowed, rejected and cost, overall and per policy, so `requests`
 counts records (one per policy per request) while `cost` / `allowed_cost` sum
-the actual units requested / admitted.
+the actual units requested / admitted. The `request_id` and `trace_id` filters
+are exact matches conjunctive with `tenant` and `since_ms`; historical rows
+that predate the correlation fields still aggregate unfiltered but never match
+a correlation filter.
 
 ## Fixed quota cost
 
@@ -632,7 +637,7 @@ absent or disabled (see [Admin surface authentication](#admin-surface-authentica
 | POST | `/v1/keys` | `201 {"key_id","tenant","scopes","secret_sha256","enabled","expires_at_ms","secret"}` (secret returned once) | same `401`; `403` scope / `admin tenant mismatch`; `400` bad JSON / missing tenant / invalid `enabled` or `expires_at_ms` / invalid `admin_auth`, `409` duplicate key id |
 | POST | `/v1/keys/{key_id}/rotate` | `200` same fields as `POST /v1/keys` with the new `secret` (returned once) | same `401`; `403` scope / `admin tenant mismatch` (only the key's owner or a `tenant: "*"` key); `400` empty key id / non-object or malformed body, `404` unknown key id |
 | POST | `/v1/quota/policies` | `201` policy object (echoes `partition_by`) | same `401`; `403` scope / `admin tenant mismatch`; `400` invalid policy / `partition_by`, `409` duplicate id |
-| GET | `/v1/quota/usage?tenant=&since=` | `200` ledger aggregate | same `401`; `403` scope / `admin tenant mismatch`; `400` non-integer `since` |
+| GET | `/v1/quota/usage?tenant=&since=&request_id=&trace_id=` | `200` ledger aggregate | same `401`; `403` scope / `admin tenant mismatch`; `400` non-integer `since`; `400 {"error":"invalid quota usage query","parameter":"trace_id",...}` for a malformed `trace_id` (not 32 lowercase hex) |
 | GET | `/v1/audit?tenant=&limit=&request_id=&trace_id=&route_id=&status=&since=&until=` | `200 {"tenant","count","entries"}` | same `401`; `403` scope / `admin tenant mismatch`; `400 {"error":"invalid audit query","parameter",...}` for a malformed `trace_id` (not 32 lowercase hex), `status` (not a 100-599 decimal integer), non-integer `since`/`until` or `until` earlier than `since`; `400` non-integer `limit` |
 | GET | `/v1/breaker/status` | `200 {"breakers":{name: snapshot, ...}}` only upstreams that already have a breaker, names sorted; read-only snapshot, never creates a breaker or advances its state | same `401`; `403` scope / `admin tenant mismatch` (global read needs a `tenant: "*"` key) |
 | POST | `/v1/breaker/reset` | `200 {"reset":["upstream",...]}` | same `401`; `403` scope / `admin tenant mismatch` (needs a `tenant: "*"` key); `400` bad JSON |

@@ -12,7 +12,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from .config import ANY_TENANT, GatewayError
 from .gateway import Gateway
-from .limits import parse_audit_filters
+from .limits import parse_audit_filters, parse_usage_filters
 
 ADMIN_GET = ("/healthz", "/v1/config", "/v1/quota/usage", "/v1/audit",
              "/v1/breaker/status")
@@ -202,8 +202,11 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._json(201, gateway.add_policy(payload), request_id)
         elif target == "/v1/quota/usage":
             tenant = self._admin_tenant(_first(params, "tenant") or "", auth_key, auth_enabled)
+            filters = parse_usage_filters(request_id=_first(params, "request_id"),
+                                          trace_id=_first(params, "trace_id"))
             self._json(200, gateway.usage(tenant,
-                                          _int_or_none(_first(params, "since"))), request_id)
+                                          _int_or_none(_first(params, "since")),
+                                          **filters), request_id)
         elif target == "/v1/audit":
             tenant = self._admin_tenant(_first(params, "tenant") or "", auth_key, auth_enabled)
             limit = _int_or_none(_first(params, "limit"))

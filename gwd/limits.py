@@ -298,23 +298,45 @@ class QuotaLedger:
         self.path = os.path.join(root, "usage.jsonl")
 
     def record(self, tenant: str, policy_id: Optional[str], key_id: Optional[str],
-               cost: int, allowed: bool, now_ms: int) -> Dict[str, Any]:
+               cost: int, allowed: bool, now_ms: int,
+               request_id: Optional[str] = None, trace_id: Optional[str] = None) -> Dict[str, Any]:
         entry = {"at": int(now_ms), "tenant": tenant, "policy_id": policy_id, "key_id": key_id,
                  "cost": int(cost), "allowed": bool(allowed)}
+        # Correlation identifiers are attached only when the caller has them:
+        # historical rows simply lack the keys and still aggregate unfiltered.
+        if request_id is not None:
+            entry["request_id"] = str(request_id)
+        if trace_id is not None:
+            entry["trace_id"] = str(trace_id)
         _append_jsonl(self.path, entry)
         return entry
 
     def entries(self, tenant: Optional[str] = None,
-                since_ms: Optional[int] = None) -> List[Dict[str, Any]]:
+                since_ms: Optional[int] = None,
+                request_id: Optional[str] = None,
+                trace_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Read the ledger, keeping only rows that satisfy every given filter.
+
+        All conditions are conjunctive; ``request_id`` and ``trace_id`` are
+        exact string matches against the stored value, so a historical row
+        that lacks the field never matches a correlation filter. Reading
+        never writes to any file.
+        """
         rows = _read_jsonl(self.path)
         if tenant:
             rows = [r for r in rows if r.get("tenant") == tenant]
         if since_ms is not None:
             rows = [r for r in rows if int(r.get("at", 0)) >= int(since_ms)]
+        if request_id is not None:
+            rows = [r for r in rows if r.get("request_id") == request_id]
+        if trace_id is not None:
+            rows = [r for r in rows if r.get("trace_id") == trace_id]
         return rows
 
-    def usage(self, tenant: Optional[str] = None, since_ms: Optional[int] = None) -> Dict[str, Any]:
-        rows = self.entries(tenant, since_ms)
+    def usage(self, tenant: Optional[str] = None, since_ms: Optional[int] = None,
+              request_id: Optional[str] = None,
+              trace_id: Optional[str] = None) -> Dict[str, Any]:
+        rows = self.entries(tenant, since_ms, request_id, trace_id)
         by_policy: Dict[str, Dict[str, int]] = {}
         allowed = rejected = cost = allowed_cost = 0
         for row in rows:
@@ -395,6 +417,25 @@ def _row_at(row: Dict[str, Any]) -> Optional[int]:
         return int(row.get("at"))
     except (TypeError, ValueError):
         return None
+
+
+def parse_usage_filters(request_id: Any = None, trace_id: Any = None) -> Dict[str, Any]:
+    """Validate raw quota-usage query values into kwargs for :meth:`QuotaLedger.usage`.
+
+    Every ``None`` input is simply absent from the result. ``request_id`` is a
+    plain exact-match string; ``trace_id`` must be exactly 32 lowercase hex
+    digits. An invalid value is rejected with
+    ``GatewayError("invalid quota usage query", 400, parameter=...)`` naming
+    the offending parameter -- it is never silently treated as absent.
+    """
+    filters: Dict[str, Any] = {}
+    if request_id is not None:
+        filters["request_id"] = str(request_id)
+    if trace_id is not None:
+        if not _TRACE_ID_RE.match(str(trace_id)):
+            raise GatewayError("invalid quota usage query", 400, parameter="trace_id")
+        filters["trace_id"] = str(trace_id)
+    return filters
 
 
 def parse_audit_filters(request_id: Any = None, trace_id: Any = None,

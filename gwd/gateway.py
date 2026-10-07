@@ -150,8 +150,14 @@ class Gateway:
                 "upstreams": len(self.upstreams.names()),
                 "config_error": self.store.last_error}
 
-    def usage(self, tenant: str = "", since_ms: Optional[int] = None) -> Dict[str, Any]:
-        return self.ledger.usage(tenant or None, since_ms)
+    def usage(self, tenant: str = "", since_ms: Optional[int] = None,
+              request_id: Optional[str] = None,
+              trace_id: Optional[str] = None) -> Dict[str, Any]:
+        """Aggregate the usage ledger; the optional correlation filters are
+        conjunctive with ``tenant`` and ``since_ms``. Read-only: it never
+        reloads config, touches a quota bucket or calls an upstream."""
+        return self.ledger.usage(tenant or None, since_ms,
+                                 request_id=request_id, trace_id=trace_id)
 
     def audit(self, tenant: str = "", limit: int = 50, **filters: Any) -> List[Dict[str, Any]]:
         """Read the audit trail; ``filters`` are validated ``AuditLog.entries``
@@ -479,10 +485,14 @@ class Gateway:
             quota = dict(quotas[0])
             for result in results:
                 # Exactly one ledger line per named policy per request, each
-                # carrying this request's full fixed cost; retries, failover
-                # and an idempotent replay never pass through here twice.
+                # carrying this request's full fixed cost and the correlation
+                # identifiers of this very pass through the pipeline: retries,
+                # failover and a breaker skip never pass through here twice,
+                # and an idempotent replay re-checks quota under its own
+                # request id and trace id.
                 self.ledger.record(tenant, result["policy_id"],
-                                   key.key_id if key else None, cost, group_allowed, now)
+                                   key.key_id if key else None, cost, group_allowed, now,
+                                   request_id=request_id, trace_id=trace_id)
             if not group_allowed:
                 insufficient = [result for result in results if not result["allowed"]]
                 first_short = next(result for result in results if not result["allowed"])
